@@ -49,10 +49,52 @@ toolchain `ld -r` also needs an explicit `-arch`, or it asserts inside an
 Objective-C pass with "unknown objc arch", which is an ld64 bug and not
 something you did.
 
+## Async host calls — the hard part, and it works
+
+A document calls `$.find(q)` synchronously; that is the language contract and
+every template depends on it. But mdy-docs implements those natives in
+JavaScript and several are async — a query awaits the database, a nested
+`$.render` awaits another render. The WASM build hides that with Asyncify.
+There is no Asyncify natively.
+
+Three ways out, and they are not equal. Rewriting the natives to be synchronous
+would diverge from the Node path forever. Making the guest `await` would break
+the contract that `$.find(q)` returns documents. So the native does neither: it
+calls into QuickJS and, if the answer is a promise, **pumps QuickJS's job queue
+until it settles**, then hands the value back synchronously. The guest never
+learns it waited, and mdy-docs' JavaScript is untouched.
+
+```
+--- mdy-native: async host calls ---
+  sync native      : -> answered synchronously
+  async native     : -> answered after awaiting
+  re-entrant render: -> inner sandbox said: 42 * 2 = 84
+  never settles    : -> (promise never settled — nothing left to run)
+  unicode round trip: -> Ašared — Uruk’s scribes, ‰, 𒀭
+```
+
+Four of those matter.
+
+**Re-entrancy is fine.** A nested `$.render` means sandbox → host → sandbox.
+The inner run gets its own `JsVm`, exactly as [../../src/vm.js](../../src/vm.js)
+gives each nesting level its own pooled instance, so nothing re-enters a
+suspended VM.
+
+**A promise that cannot settle says so.** Pumping finds no job, and rather than
+hang, the deadlock is reported. In a native backend the filesystem is
+synchronous C so it should not arise — but a backend that hangs silently is the
+failure this whole exercise has been paying for.
+
+**Unicode survives, including astral.** That last line is not decoration: the
+first conversion truncated every byte to a code unit, and it was an em dash
+coming back as `???` that gave it away. The corpus is Akkadian transliteration
+and cuneiform, so this had to be right before anything real crossed.
+
 ## Next
 
-The async question. mdy-docs' natives return promises — a nested render, a
+The remaining question. mdy-docs' natives return promises — a nested render, a
 query — and the WASM build leans on Asyncify to make that look synchronous to
-the guest. lamassu's C API has a promise path for it (`js_promise_new`,
-`js_resolve`, `js_run_jobs`), so the pieces exist; joining them to QuickJS's
-job queue is the work after this. Then nisaba, then mdy-docs' own bundle.
+the guest. nisaba, bound the same way lamassu now is, and then mdy-docs' own bundle
+loaded into QuickJS with `@mdy-docs/lamassu-js` and `@mdy-docs/nisaba-db`
+replaced by these bindings. At that point the corpus builds outside a browser
+and the ~2x estimate becomes a measurement.
