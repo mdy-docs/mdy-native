@@ -45,7 +45,31 @@ static int buf_put(Buf *b, const char *s, size_t n) {
 /* `root` and a `/`-separated relative path as one path. A root of "/" and an
  * absolute-looking relative path is the shape mdy-docs' module loader uses
  * (`fs.read('/', '/abs/path')`), so it has to join to one slash, not two. */
+/*
+ * Is this path already absolute? A leading `/` everywhere, and on Windows also
+ * a drive letter — `C:/Users/…`. Both spellings reach here: mdy-docs' module
+ * loader resolves a specifier to an absolute path and then asks for it with
+ * `fs.read('/', thatPath)`, so on Windows `rel` arrives as `C:/…` while `root`
+ * is a bare slash.
+ */
+static int is_absolute(const char *p) {
+    if (p[0] == '/') return 1;
+#ifdef _WIN32
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) &&
+        p[1] == ':' && (p[2] == '/' || p[2] == '\\')) return 1;
+#endif
+    return 0;
+}
+
 static char *at(const char *root, const char *rel) {
+    /*
+     * An absolute `rel` under a root of "/" IS the path — joining them would
+     * produce `/C:/Users/…` on Windows, which names nothing. The POSIX case
+     * happens to work either way; this makes both explicit rather than relying
+     * on one of them being harmless.
+     */
+    if (is_absolute(rel) && root[0] == '/' && root[1] == '\0') return strdup(rel);
+
     size_t rlen = strlen(root);
     while (rlen > 1 && root[rlen - 1] == '/') rlen--;
     while (*rel == '/') rel++;

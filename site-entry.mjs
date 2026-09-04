@@ -30,15 +30,21 @@ if (!rawRoot) {
    * That is the right check — it is what stops a template reaching outside its
    * package — and the fix belongs here, where the spelling comes from.
    */
+  // "Absolute" is a leading slash on POSIX and a drive letter on Windows —
+  // `C:/work/site`. Treating the latter as relative would prepend the cwd and
+  // produce `C:/work/C:/work/site`.
+  const isAbsolute = (p) => p.startsWith('/') || /^[A-Za-z]:[/\\]/.test(p);
   const absolute = (p) => {
-    const parts = (p.startsWith('/') ? p : `${globalThis.__fs_cwd()}/${p}`).split('/');
+    const raw = (isAbsolute(p) ? p : `${globalThis.__fs_cwd()}/${p}`).replace(/\\/g, '/');
+    const drive = /^([A-Za-z]:)\//.exec(raw);
+    const parts = raw.split('/');
     const out = [];
     for (const part of parts) {
       if (part === '' || part === '.') continue;
       if (part === '..') out.pop();
       else out.push(part);
     }
-    return `/${out.join('/')}`;
+    return drive ? out.join('/') : `/${out.join('/')}`;
   };
   const root = absolute(rawRoot);
   const out = absolute(rawOut ?? `${root}/dist`);

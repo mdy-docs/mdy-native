@@ -1,0 +1,174 @@
+<!doctype html><html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Async &#x26; host calls | lamassu-js</title>
+<meta name="description" content="A strict, safe JavaScript-subset engine written in C, compiled to WebAssembly — sandboxed evaluation for untrusted templates.">
+<link rel="icon" href="/favicon.svg">
+<link rel="stylesheet" href="/style.css">
+<script>try { const s = localStorage.getItem("mdy-docs-theme"); if (s === "dark" || (!s && matchMedia("(prefers-color-scheme: dark)").matches)) document.documentElement.classList.add("dark"); } catch (e) {}</script>
+</head>
+<body class="layout-doc">
+<header class="navbar">
+<div class="navbar-inner">
+<button class="hamburger" id="hamburger" aria-label="Toggle sidebar">
+<span></span>
+<span></span>
+<span></span>
+</button>
+<a class="brand" href="/">
+<img src="/favicon.svg" alt="" class="brand-logo">
+<span>lamassu-js</span>
+</a>
+<div class="navbar-right">
+<div class="search-box" id="search-box">
+<input id="search-input" type="search" placeholder="Search" autocomplete="off" aria-label="Search docs">
+<ul id="search-results" hidden></ul>
+</div>
+<nav class="nav-links" aria-label="Main navigation">
+<a href="/guide/" class="nav-link active">Guide</a>
+<a href="/api/" class="nav-link">API Reference</a>
+<a href="https://mdy-docs.github.io/lamassu-js/" class="nav-link" target="_blank" rel="noreferrer">Playground</a>
+</nav>
+<button id="theme-toggle" class="theme-toggle" aria-label="Toggle dark mode">
+<svg class="sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+<circle cx="12" cy="12" r="5"></circle>
+<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"></path>
+</svg>
+<svg class="moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+</svg>
+</button>
+<div class="social-links">
+<a class="social-link" href="https://github.com/mdy-docs/lamassu-js" target="_blank" rel="noreferrer" aria-label="GitHub">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+<path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"></path>
+</svg>
+</a>
+<a class="social-link" href="https://www.npmjs.com/package/@mdy-docs/lamassu-js" target="_blank" rel="noreferrer" aria-label="npm">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+<path d="M0 0v24h24V0H0zm19.2 19.2h-2.4V9.6h-4.8v9.6H4.8V4.8h14.4v14.4z"></path>
+</svg>
+</a>
+</div>
+</div>
+</div>
+</header>
+<div class="page-wrap">
+<div class="sidebar-mask" id="sidebar-mask"></div>
+<aside class="sidebar" id="sidebar">
+<nav class="sidebar-top-nav">
+<a href="/guide/">Guide</a>
+<a href="/api/">API Reference</a>
+<a href="https://mdy-docs.github.io/lamassu-js/" target="_blank" rel="noreferrer">Playground</a>
+</nav>
+<nav class="sidebar-nav"><section class="sidebar-group"><p class="sidebar-group-title">Introduction</p><ul><li><a href="/guide/" class="sidebar-link">What is lamassu-js?</a></li></ul></section><section class="sidebar-group"><p class="sidebar-group-title">The language</p><ul><li><a href="/guide/language/" class="sidebar-link">Supported syntax</a></li><li><a href="/guide/builtins/" class="sidebar-link">Built-ins</a></li><li><a href="/guide/async/" class="sidebar-link active">Async &#x26; host calls</a></li><li><a href="/guide/deviations/" class="sidebar-link">Deviations from real JS</a></li></ul></section></nav>
+</aside>
+<main class="content">
+<div class="doc">
+<article class="doc-body">
+<h1 id="async--host-calls">Async &#x26; host calls</h1>
+<p><code>async</code>/<code>await</code> and the <code>Promise</code> built-in work as you'd expect inside a
+script. What's specific to lamassu-js is how a <strong>native/host</strong> function —
+one written in C (or JS, via the npm package) — hands time-consuming work
+back to a guest <code>await</code>. There are two distinct, complementary mechanisms.</p>
+<h2 id="1.-guest-level-await-of-a-native-returned-promise">1. Guest-level <code>await</code> of a native-returned promise</h2>
+<p>A native creates a pending promise and returns it immediately; guest code
+<code>await</code>s it exactly like any other promise. This suspends the <em>JS fiber</em>,
+not the C (or WASM) call stack — call frames live on the heap in a
+suspendable <code>JsFiber</code>, so suspension is just "the fiber stops being run."
+No C stack involved is also why <code>await</code> is cheap in this engine generally.</p>
+<p>The host settles the promise later — from wherever real time actually
+happens (a database callback, a <code>setTimeout</code>, an HTTP response handler) —
+and drains the microtask queue to resume anything waiting on it.</p>
+<pre><code class="language-c">// native side (C)
+JsValue p = js_promise_new(ctx);
+// ... stash p somewhere reachable, keep it GC-rooted ...
+*result = p;
+return true;
+</code></pre>
+<pre><code class="language-c">// later, when the real work finishes:
+js_resolve(ctx, p, value);   // or js_reject(ctx, p, reason)
+js_run_jobs(ctx);            // resumes anything awaiting p
+</code></pre>
+<pre><code class="language-js">// guest side
+const value = await nativeThing();
+</code></pre>
+<p>This is the mechanism <code>js_promise_new</code>/<code>js_resolve</code>/<code>js_reject</code>/
+<code>js_run_jobs</code> expose in the <a href="/api/c-embedding/">C embedding API</a>. The npm
+package's WASM build exercises it with a small test-only
+<code>__nativeDefer</code>/<code>lamassu_settle_deferred</code> pair in its CI smoke test, settled
+from a real JS timer callback — the same pattern a browser or Node host
+would use with its own event loop.</p>
+<h2 id="2.-__hostcallname-argsjson--synchronous-looking-asyncify-powered">2. <code>__hostcall(name, argsJson)</code> — synchronous-looking, Asyncify-powered</h2>
+<p>The npm package additionally exposes <code>__hostcall</code>, a <em>synchronous-looking</em>
+guest call: no guest-level <code>await</code> needed at all. Guest code calls it like
+an ordinary function; under the hood it suspends the <strong>entire WebAssembly
+call stack</strong> via Emscripten Asyncify while the embedder's JS handler runs
+(which may itself be <code>async</code>), then resumes with the result.</p>
+<pre><code class="language-js">const engine = await createLamassu({
+  natives: {
+    // may be async — the guest still sees a synchronous call
+    twice: async (n) => {
+      await someRealAsyncWork();
+      return n * 2;
+    },
+  },
+});
+
+await engine.eval("__hostcall('twice', JSON.stringify([21]))");
+// => "42" (JSON-encoded)
+</code></pre>
+<p>Arguments arrive at the native as a JSON string; the resolved value is
+JSON-encoded on the way back. A handler that throws rethrows inside the
+guest at the call site.</p>
+<div class="custom-block warning">
+<p class="custom-block-title">Not reentrant</p>
+<p>While an eval is suspended in a host call, that WASM instance must not be
+re-entered — Asyncify is not reentrant. If a native itself needs to trigger
+a <em>nested</em> eval, use one engine instance per nesting level.</p>
+</div>
+<h2 id="which-one-do-i-want">Which one do I want?</h2>
+<ul>
+<li>Writing a <strong>C embedder</strong>? You have direct access to <code>js_promise_new</code> /
+<code>js_resolve</code> / <code>js_run_jobs</code> — mechanism 1 is the natural fit, and it's
+also what <code>async</code>/<code>await</code> in guest code compiles down to internally.</li>
+<li>Using the <strong>npm package</strong>? <code>__hostcall</code> (mechanism 2) is what's wired up
+today — pass an object of <code>natives</code> to <code>createLamassu</code>, and any of them
+can be <code>async</code>. The guest-level mechanism exists in the engine but isn't
+exposed as a general-purpose guest API on the npm side yet (only as the
+test-only <code>__nativeDefer</code> hook used to exercise it in CI).</li>
+</ul>
+<h2 id="top-level-await">Top-level await</h2>
+<p>A module's <code>await</code> at the top level works, including across
+<a href="/guide/language/#modules">modules</a> with async dependencies. One subtlety:
+if a top-level-await module is still pending when the host's run call
+returns, the host is responsible for settling whatever it's waiting on and
+draining jobs — the module's completion becomes observable once that
+happens, driven by the microtask queue rather than a return value.</p>
+</article>
+<div class="doc-footer">
+<div class="edit-info">
+<a class="edit-link" href="https://github.com/mdy-docs/lamassu-js/edit/main/docs-site/guide/async.md" target="_blank" rel="noreferrer">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+</svg>
+<span>Edit this page on GitHub</span>
+</a>
+<span class="last-updated">
+<span>Last updated:</span>
+<time>Aug 31, 2026</time>
+</span>
+</div>
+<nav class="prev-next"><div class="pager"><a href="/guide/builtins/" class="pager-link prev"><span class="pager-desc">Previous page</span><span class="pager-title">Built-ins</span></a></div><div class="pager"><a href="/guide/deviations/" class="pager-link next"><span class="pager-desc">Next page</span><span class="pager-title">Deviations from real JS</span></a></div></nav>
+</div>
+</div>
+<div class="aside">
+<nav id="outline" class="outline"><p class="outline-title">On this page</p><ul class="outline-list"><li><a href="#1.-guest-level-await-of-a-native-returned-promise" class="outline-link">1. Guest-level await of a native-returned promise</a></li><li><a href="#2.-__hostcallname-argsjson--synchronous-looking-asyncify-powered" class="outline-link">2. __hostcall(name, argsJson) — synchronous-looking, Asyncify-powered</a></li><li><a href="#which-one-do-i-want" class="outline-link">Which one do I want?</a></li><li><a href="#top-level-await" class="outline-link">Top-level await</a></li></ul></nav>
+</div>
+</main>
+</div>
+<script src="/docs.js"></script>
+</body>
+</html>

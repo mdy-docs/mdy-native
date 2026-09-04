@@ -17,7 +17,12 @@ NISABA  ?= ../../third_party/nisaba-db
 LAMASSU ?= ../../third_party/lamassu-js
 QUICKJS ?= third_party/quickjs
 
-CFLAGS  += -std=c11 -Wall -Wextra -O2 -g -I$(LAMASSU)/include -I$(QUICKJS)
+# gnu11, not c11. glibc hides POSIX declarations under a strict standard —
+# strdup came back as an implicit declaration on Linux and st_mtim as an
+# unknown field, both of which compile fine on macOS, which exposes them
+# regardless. lamassu's own Makefile carries the same note and reaches for
+# -D_POSIX_C_SOURCE; gnu11 gets the same result and also works under mingw.
+CFLAGS  += -std=gnu11 -Wall -Wextra -O2 -g -I$(LAMASSU)/include -I$(QUICKJS)
 LDLIBS  += -lm
 
 # Windows has no libpthread of its own and mingw's winpthreads is not needed:
@@ -125,7 +130,7 @@ NIS_RENAME := -Dcompile_into=nis_re_compile_into -Dparse_alt=nis_re_parse_alt \
 build/libnisaba.a: $(NIS_SRCS)
 	@mkdir -p build/nis
 	@for f in $(NIS_SRCS); do \
-	  $(CC) -std=c11 -O2 $(NIS_INC) $(NIS_RENAME) -c $$f -o build/nis/`basename $$f .c`.o || exit 1; \
+	  $(CC) -std=gnu11 -O2 $(NIS_INC) $(NIS_RENAME) -c $$f -o build/nis/`basename $$f .c`.o || exit 1; \
 	done
 	$(AR) rcs $@ build/nis/*.o
 
@@ -155,7 +160,41 @@ build/bench.js: bench-entry.mjs bench-body.mjs scripts-build.mjs shims/lamassu.j
 SITE ?= fixture
 OUT  ?= build/site-out
 
-.PHONY: native site bench clean
+# ---- the golden outputs ---------------------------------------------------
+#
+# What the node CLI produces for three deterministic sites, committed so CI can
+# check the native backend byte-for-byte on a platform where node cannot run
+# the build at all (it needs the WASM engines, which are emscripten build
+# products and are not in git). See golden/README.md.
+GOLDEN_SITES := fixture ../../examples/docs-site ../../examples/messaging
+
+.PHONY: golden check-golden
+golden:
+	@rm -rf golden/fixture golden/docs-site golden/messaging
+	@for d in $(GOLDEN_SITES); do \
+	  node ../../bin/mdy.js build $$d --out golden/`basename $$d` > /dev/null || exit 1; \
+	done
+	@echo "regenerated golden/ — read the diff before committing it"
+
+check-golden: build/mdy-native$(EXE) build/site.js
+	@bin=./build/mdy-native$(EXE); fail=0; \
+	for d in $(GOLDEN_SITES); do \
+	  n=`basename $$d`; \
+	  rm -rf build/check-$$n; \
+	  $$bin build/site.js $$d build/check-$$n > /dev/null || exit 1; \
+	  if diff -r golden/$$n build/check-$$n > /dev/null; then \
+	    echo "  $$n: identical to golden"; \
+	  else \
+	    echo "  $$n: DIFFERS from golden"; diff -r golden/$$n build/check-$$n | head -20; fail=1; \
+	  fi; \
+	done; \
+	exit $$fail
+
+.PHONY: build native site bench clean
+# `make build` rather than `make build/mdy-native`: the target's name carries
+# .exe on Windows, and a caller should not have to know that.
+build: build/mdy-native$(EXE)
+
 native: build/mdy-native$(EXE) build/mdy.js
 	@./build/mdy-native$(EXE) build/mdy.js
 

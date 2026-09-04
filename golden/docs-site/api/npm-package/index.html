@@ -1,0 +1,166 @@
+<!doctype html><html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>npm package | lamassu-js</title>
+<meta name="description" content="A strict, safe JavaScript-subset engine written in C, compiled to WebAssembly — sandboxed evaluation for untrusted templates.">
+<link rel="icon" href="/favicon.svg">
+<link rel="stylesheet" href="/style.css">
+<script>try { const s = localStorage.getItem("mdy-docs-theme"); if (s === "dark" || (!s && matchMedia("(prefers-color-scheme: dark)").matches)) document.documentElement.classList.add("dark"); } catch (e) {}</script>
+</head>
+<body class="layout-doc">
+<header class="navbar">
+<div class="navbar-inner">
+<button class="hamburger" id="hamburger" aria-label="Toggle sidebar">
+<span></span>
+<span></span>
+<span></span>
+</button>
+<a class="brand" href="/">
+<img src="/favicon.svg" alt="" class="brand-logo">
+<span>lamassu-js</span>
+</a>
+<div class="navbar-right">
+<div class="search-box" id="search-box">
+<input id="search-input" type="search" placeholder="Search" autocomplete="off" aria-label="Search docs">
+<ul id="search-results" hidden></ul>
+</div>
+<nav class="nav-links" aria-label="Main navigation">
+<a href="/guide/" class="nav-link">Guide</a>
+<a href="/api/" class="nav-link active">API Reference</a>
+<a href="https://mdy-docs.github.io/lamassu-js/" class="nav-link" target="_blank" rel="noreferrer">Playground</a>
+</nav>
+<button id="theme-toggle" class="theme-toggle" aria-label="Toggle dark mode">
+<svg class="sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+<circle cx="12" cy="12" r="5"></circle>
+<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"></path>
+</svg>
+<svg class="moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+</svg>
+</button>
+<div class="social-links">
+<a class="social-link" href="https://github.com/mdy-docs/lamassu-js" target="_blank" rel="noreferrer" aria-label="GitHub">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+<path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"></path>
+</svg>
+</a>
+<a class="social-link" href="https://www.npmjs.com/package/@mdy-docs/lamassu-js" target="_blank" rel="noreferrer" aria-label="npm">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+<path d="M0 0v24h24V0H0zm19.2 19.2h-2.4V9.6h-4.8v9.6H4.8V4.8h14.4v14.4z"></path>
+</svg>
+</a>
+</div>
+</div>
+</div>
+</header>
+<div class="page-wrap">
+<div class="sidebar-mask" id="sidebar-mask"></div>
+<aside class="sidebar" id="sidebar">
+<nav class="sidebar-top-nav">
+<a href="/guide/">Guide</a>
+<a href="/api/">API Reference</a>
+<a href="https://mdy-docs.github.io/lamassu-js/" target="_blank" rel="noreferrer">Playground</a>
+</nav>
+<nav class="sidebar-nav"><section class="sidebar-group"><p class="sidebar-group-title">API Reference</p><ul><li><a href="/api/" class="sidebar-link">Overview</a></li><li><a href="/api/npm-package/" class="sidebar-link active">npm package</a></li><li><a href="/api/c-embedding/" class="sidebar-link">C embedding API</a></li></ul></section></nav>
+</aside>
+<main class="content">
+<div class="doc">
+<article class="doc-body">
+<h1 id="npm-package">npm package</h1>
+<pre><code class="language-sh">npm install @mdy-docs/lamassu-js
+</code></pre>
+<pre><code class="language-js">import { createLamassu } from "@mdy-docs/lamassu-js";
+
+const engine = await createLamassu();
+console.log(await engine.eval("1 + 2 * 3")); // "⇒ 7"
+</code></pre>
+<p>The package is the engine's REPL surface compiled to a WebAssembly ES
+module, wrapped in a small friendly API. It works the same way in Node and
+the browser; in native ESM the sibling <code>.wasm</code> is located automatically via
+<code>import.meta.url</code>.</p>
+<h2 id="createlamassuoptions"><code>createLamassu(options?)</code></h2>
+<pre><code class="language-ts">function createLamassu(options?: {
+  wasmUrl?: string;
+  print?: (text: string) => void;
+  natives?: Record&#x3C;string, (...args: any[]) => any>;
+}): Promise&#x3C;Lamassu>;
+</code></pre>
+<ul>
+<li><strong><code>wasmUrl</code></strong> — explicit URL for <code>lamassu.wasm</code>. Only needed when a
+bundler (Vite, webpack, …) relocates the module — import it with
+<code>import wasmUrl from "@mdy-docs/lamassu-js/lamassu.wasm?url"</code> and pass it
+through. Omit for plain native ESM.</li>
+<li><strong><code>print</code></strong> — sink for the engine's <em>internal</em> stdout. Rarely needed;
+a script's <code>print(...)</code> calls are captured and returned by <code>eval</code> anyway.</li>
+<li><strong><code>natives</code></strong> — an object of host functions callable from guest code via
+<code>__hostcall(name, argsJson)</code>. Any of them may be <code>async</code> — see
+<a href="/guide/async/#2-hostcall-name-argsjson-synchronous-looking-asyncify-powered">Async &#x26; host calls</a>.</li>
+</ul>
+<p>Resolves to a <code>Lamassu</code> instance:</p>
+<h2 id="engine.evalsource"><code>engine.eval(source)</code></h2>
+<pre><code class="language-ts">eval(source: string): Promise&#x3C;string>;
+</code></pre>
+<p>Evaluates <code>source</code> in a <strong>persistent REPL context</strong> — top-level <code>let</code>,
+<code>const</code>, and <code>function</code> declarations carry across calls, so a sequence of
+<code>eval</code> calls behaves like a REPL session, not independent scripts.</p>
+<p>The resolved string is the script's <code>print(...)</code> output, followed by:</p>
+<ul>
+<li><code>"⇒ " + &#x3C;completion value></code> on success, or</li>
+<li><code>"Uncaught " + &#x3C;error></code> if the script threw.</li>
+</ul>
+<p><code>eval</code> never rejects for a <em>guest</em> error (a thrown exception inside the
+script) — it resolves with the <code>"Uncaught ..."</code> line either way. It's
+<code>async</code> because a guest <code>__hostcall</code> may suspend WASM execution while a
+native runs.</p>
+<pre><code class="language-js">await engine.eval("let x = 40;");
+await engine.eval("print('hi'); x + 2;");
+// => "hi\n⇒ 42"
+</code></pre>
+<h2 id="engine.setnativesnext"><code>engine.setNatives(next)</code></h2>
+<pre><code class="language-ts">setNatives(next?: Record&#x3C;string, (...args: any[]) => any>): void;
+</code></pre>
+<p>Replaces the natives table wholesale — useful for swapping in a different
+set of host functions per request/task without recreating the engine.</p>
+<h2 id="engine.reset"><code>engine.reset()</code></h2>
+<pre><code class="language-ts">reset(): void;
+</code></pre>
+<p>Discards all REPL state (every persistent global, every module) and starts
+from a fresh VM + context. The natives table is untouched.</p>
+<h2 id="engine.module"><code>engine.module</code></h2>
+<p>The underlying Emscripten module object (<code>M</code> from
+<code>createLamassuModule(...)</code>), for advanced use — e.g. calling an exported C
+function directly via <code>module.ccall</code>/<code>module.cwrap</code> that isn't wrapped by
+this API yet.</p>
+<h2 id="errors-vs.-exceptions">Errors vs. exceptions</h2>
+<p>A <strong>syntax error</strong> in <code>source</code> and a <strong>runtime exception</strong> thrown by the
+guest script both surface the same way: as an <code>"Uncaught ..."</code> /
+<code>"SyntaxError: ..."</code> line in the resolved string, never as a rejected
+promise. The promise only rejects for a genuine host-side failure (e.g. the
+WASM module failing to instantiate).</p>
+</article>
+<div class="doc-footer">
+<div class="edit-info">
+<a class="edit-link" href="https://github.com/mdy-docs/lamassu-js/edit/main/docs-site/api/npm-package.md" target="_blank" rel="noreferrer">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+</svg>
+<span>Edit this page on GitHub</span>
+</a>
+<span class="last-updated">
+<span>Last updated:</span>
+<time>Aug 31, 2026</time>
+</span>
+</div>
+<nav class="prev-next"><div class="pager"><a href="/api/" class="pager-link prev"><span class="pager-desc">Previous page</span><span class="pager-title">Overview</span></a></div><div class="pager"><a href="/api/c-embedding/" class="pager-link next"><span class="pager-desc">Next page</span><span class="pager-title">C embedding API</span></a></div></nav>
+</div>
+</div>
+<div class="aside">
+<nav id="outline" class="outline"><p class="outline-title">On this page</p><ul class="outline-list"><li><a href="#createlamassuoptions" class="outline-link">createLamassu(options?)</a></li><li><a href="#engine.evalsource" class="outline-link">engine.eval(source)</a></li><li><a href="#engine.setnativesnext" class="outline-link">engine.setNatives(next)</a></li><li><a href="#engine.reset" class="outline-link">engine.reset()</a></li><li><a href="#engine.module" class="outline-link">engine.module</a></li><li><a href="#errors-vs.-exceptions" class="outline-link">Errors vs. exceptions</a></li></ul></nav>
+</div>
+</main>
+</div>
+<script src="/docs.js"></script>
+</body>
+</html>
