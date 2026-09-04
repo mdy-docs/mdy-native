@@ -251,7 +251,9 @@ scalar `_id`, and the primary tree's keys are fixed-width OID bytes.
 ## mdy-docs' own tests, on this backend
 
 ```
-# native: 684 passed, 0 failed, 1 skipped in 817ms
+macOS    # native: 684 passed, 0 failed, 1 skipped in 807ms
+Linux    # native: 684 passed, 0 failed, 1 skipped in 676ms
+Windows  # native: 684 passed, 0 failed, 1 skipped in 907ms
 ```
 
 Not a copy and not a rewrite: [tests-entry.mjs](tests-entry.mjs) imports the
@@ -288,7 +290,7 @@ producing a real thumbnail, for the same WebAssembly reason. The runner fails
 if a name on that list matches nothing, so a stale entry cannot quietly hide a
 real result.
 
-### Four things the port found
+### Six things the port found
 
 Porting a suite is worth it for what it turns up, and this turned up four.
 
@@ -314,6 +316,20 @@ Porting a suite is worth it for what it turns up, and this turned up four.
   script blocks run in the *host* runtime (`new Function`), so which one that
   is depends on where mdy-docs is running. The test now matches either; its
   intent was that the failure names the missing identifier.
+
+Two more came from running it on Windows, and only Windows could have found
+them:
+
+- **A timer that is not due yet is not "nothing left to run".** Its clock has
+  ~15.6 ms granularity and `Sleep` can return early, so the event loop would
+  wake from a 10 ms timer with the clock reading the same tick, fire nothing,
+  and report the promise as unsettleable. A timer existing means progress is
+  guaranteed, so waiting *is* progress.
+- **`/C:/…` is a drive path with a spurious leading slash.** mdy-docs says
+  "this path is absolute" by passing it as `fs.read('/', absolutePath)`, and
+  `nodeFsProvider` joins the two before the filesystem sees them — producing
+  `/D:/…` on Windows, which names nothing, so every guest `import` failed.
+  Node's own win32 `join` does the same; it is not a case it was built for.
 
 `fs.watch` is polled rather than native, and that is said plainly in the shim.
 A real recursive watcher is kqueue, inotify and `ReadDirectoryChangesW` — the
