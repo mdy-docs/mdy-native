@@ -22,8 +22,6 @@
 #include "db.h"
 #include "nis.h"
 
-#define MAX_COLLECTIONS 8
-
 #define MAX_INDEXES 4
 
 /* A descriptor on POSIX, a HANDLE on Windows; bj_io takes its address. */
@@ -47,7 +45,21 @@ typedef struct {
     int used;
 } Slot;
 
-static Slot g_slots[MAX_COLLECTIONS];
+/*
+ * The slot table GROWS rather than being capped. It was eight, which was fine
+ * for a build — one document set per package — and wrong the moment mdy-docs'
+ * own test suite ran here: it opens a set per test, hundreds of them, and the
+ * ninth failed with "could not open a collection".
+ *
+ * Growing alone would only move the failure to the file-descriptor limit,
+ * since every collection holds an open temp file (and one more per index). The
+ * other half of the fix is in host.c: the handle is wrapped in a JS object
+ * whose finalizer closes it, so a collection is reclaimed when the JavaScript
+ * that owned it becomes unreachable. That is the lifetime the WASM binding
+ * gets from its own GC, and this is how a native host earns the same.
+ */
+static Slot *g_slots;
+static int g_slot_count;
 
 /*
  * The four bj_io callbacks, which are this file's entire platform surface —
@@ -128,8 +140,16 @@ static int ref_bad(FileRef f) {
 
 int nis_open(void) {
     int slot = -1;
-    for (int i = 0; i < MAX_COLLECTIONS; i++) if (!g_slots[i].used) { slot = i; break; }
-    if (slot < 0) return -1;
+    for (int i = 0; i < g_slot_count; i++) if (!g_slots[i].used) { slot = i; break; }
+    if (slot < 0) {
+        int grown = g_slot_count ? g_slot_count * 2 : 16;
+        Slot *next = realloc(g_slots, (size_t)grown * sizeof *next);
+        if (!next) return -1;
+        memset(next + g_slot_count, 0, (size_t)(grown - g_slot_count) * sizeof *next);
+        g_slots = next;
+        slot = g_slot_count;
+        g_slot_count = grown;
+    }
 
     FileRef fd = temp_fd();
     if (ref_bad(fd)) return -1;
@@ -146,7 +166,7 @@ int nis_open(void) {
 }
 
 static Slot *slot_of(int handle) {
-    if (handle < 0 || handle >= MAX_COLLECTIONS || !g_slots[handle].used) return NULL;
+    if (handle < 0 || handle >= g_slot_count || !g_slots[handle].used) return NULL;
     return &g_slots[handle];
 }
 

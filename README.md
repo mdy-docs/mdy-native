@@ -7,6 +7,7 @@ memory ceiling. See [docs/desktop-plan.md](../../docs/desktop-plan.md) —
 
 ```sh
 make native            # build both halves, run the checks
+make test              # mdy-docs' OWN test suite, against this backend
 make site SITE=<dir>   # `mdy build`, natively
 make bench             # the same 200-document set, native and over WASM in node
 ```
@@ -246,6 +247,79 @@ a temp file, which is not a compromise — the on-disk B+tree is nisaba's format
 without one; the JS binding generates the ObjectId, so a native binding has to.
 That is the same rule met from the other side earlier: nisaba will not accept a
 scalar `_id`, and the primary tree's keys are fixed-width OID bytes.
+
+## mdy-docs' own tests, on this backend
+
+```
+# native: 684 passed, 0 failed, 1 skipped in 817ms
+```
+
+Not a copy and not a rewrite: [tests-entry.mjs](tests-entry.mjs) imports the
+same files `npm test` runs, in place. A copy would drift, and a suite that has
+drifted proves nothing about the thing it is meant to be checking. What changes
+is only what `node:test`, `node:assert`, `node:fs`, `node:path`, `node:os`,
+`node:url`, `node:zlib` and `node:vm` resolve to — [shims/node/](shims/node/),
+about 700 lines over the C in [src/fsx.c](src/fsx.c).
+
+This is the strongest evidence for what this package actually claims. The
+backend's premise is that it runs mdy-docs *unchanged*; mdy-docs' own tests
+passing on it says that, where a separate native suite would only ever check
+what someone thought to re-check.
+
+Aliasing `node:fs/promises` has a second effect worth knowing: `nodeFsProvider`
+reaches for it through a lazy dynamic import, so the DEFAULT provider works
+natively too. A test that calls `renderScriptSite(dir)` with no provider runs
+here with nothing changed.
+
+**What does not run, and why each is the runtime rather than the port.** 91 of
+776 tests, in five files plus one:
+
+| | |
+| --- | --- |
+| `cli.test.js` (34) | spawns `bin/mdy.js` as a subprocess. There is no `child_process` here and there should not be — this backend *is* the thing a CLI would spawn. |
+| `build.test.js` (28) | builds `examples/blog` at module top level, and that example calls `$.resize`. The file cannot be imported. `site-memory-build.test.js` covers `buildSite` through a provider, which is the path this backend takes. |
+| `serve.test.js` (11) | stands up a `node:http` server. Serving is the plan's Phase 1c. |
+| `images.test.js` (10) | the @jsquash codecs are WebAssembly. |
+| `search-widget.test.js` (5) | runs the shipped widget against a fake DOM; it is testing browser JavaScript. |
+| `opfs-provider.test.js` (3) | OPFS is a browser API. |
+
+One further test is skipped **by name**, with its reason printed — `$.resize`
+producing a real thumbnail, for the same WebAssembly reason. The runner fails
+if a name on that list matches nothing, so a stale entry cannot quietly hide a
+real result.
+
+### Four things the port found
+
+Porting a suite is worth it for what it turns up, and this turned up four.
+
+- **A collection had no lifetime.** `nis_open` handed back an integer from a
+  fixed table of eight, and nothing ever closed one — fine for a build, which
+  opens one set per package, and wrong the moment a suite opened one per test.
+  The table grows now, and more importantly the handle rides inside a JS object
+  whose **finalizer** closes it, so a collection is reclaimed when the
+  JavaScript that owned it becomes unreachable. That is the lifetime nisaba's
+  WASM binding gets from its own GC; this is a native host earning the same.
+- **A rejected host call was wrapped, not propagated.** Prefixing the reason
+  with "the host rejected: " looked harmless until a cyclic `$.render` — every
+  level of the recursion added another copy and the depth guard's message
+  arrived buried under a dozen of them. The WASM binding rethrows verbatim, and
+  now so does this.
+- **There was no `setTimeout`.** QuickJS's timers live in quickjs-libc, which
+  this host deliberately does not link. The job pump is now a small event loop:
+  when no job is ready and a timer is pending, it waits for the earliest and
+  fires it. Enough, because nothing here has I/O to wait on — the filesystem is
+  synchronous C.
+- **A test was coupled to V8's wording.** `missing is not defined` in V8,
+  `'missing' is not defined` in QuickJS, for the same `ReferenceError` — and
+  script blocks run in the *host* runtime (`new Function`), so which one that
+  is depends on where mdy-docs is running. The test now matches either; its
+  intent was that the failure names the missing identifier.
+
+`fs.watch` is polled rather than native, and that is said plainly in the shim.
+A real recursive watcher is kqueue, inotify and `ReadDirectoryChangesW` — the
+plan's Phase 3 — and mdy-docs already ships `watchByPolling` as its own
+fallback where a native watcher is unavailable, so this is the codebase's
+existing position rather than a new one.
 
 ## Three platforms
 

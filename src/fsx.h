@@ -51,4 +51,33 @@ int fsx_remove(const char *root, const char *rel);
  * so something has to make it absolute, and only the host knows where it is. */
 char *fsx_cwd(void);
 
+/*
+ * ---- what the ported test suite needs -----------------------------------
+ *
+ * mdy-docs' own tests do real filesystem work — they write a site into a temp
+ * directory and build it — so running them natively needs more than the
+ * provider contract does. These back the `node:fs` shims in ../shims/node/,
+ * and nothing in the backend proper calls them.
+ */
+
+/* One directory level, one entry per line, NUL terminated; a directory's name
+ * carries a trailing `/` so a caller can tell them apart without a second
+ * call. Missing directory → NULL (distinct from an empty one, which is ""),
+ * because `readdir` on a missing path IS an error where `list` is not. */
+char *fsx_readdir(const char *path);
+
+/* mkdir -p. 0 on success, and an existing directory is success. */
+int fsx_mkdirp(const char *path);
+
+/* Remove a file, or a directory and everything under it. A missing path is
+ * not an error — this is `rm -rf`, which is what the tests reach for. */
+int fsx_rm_rf(const char *path);
+
+/* Create a uniquely named directory whose path starts with `prefix`, as
+ * mkdtemp does, and return it. Caller frees. NULL on failure. */
+char *fsx_mkdtemp(const char *prefix);
+
+/* The system temp directory, without a trailing separator. Caller frees. */
+char *fsx_tmpdir(void);
+
 #endif

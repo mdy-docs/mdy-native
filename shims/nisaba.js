@@ -37,7 +37,17 @@ const bufferOf = (u8) =>
 export class MemoryStorageProvider {}
 
 class Collection {
-  constructor(handle) { this.handle = handle; }
+  /*
+   * `token` is an opaque object from the host whose finalizer closes the
+   * collection — see js_nis_open in ../src/host.c. Holding it here is what
+   * gives a collection the lifetime of the JavaScript that uses it, so a
+   * process opening hundreds of document sets does not run out of file
+   * descriptors. `handle` is the number every other native takes.
+   */
+  constructor(token) {
+    this.token = token;
+    this.handle = token.handle;
+  }
 
   async insertOne(doc) {
     const withId = '_id' in doc ? doc : { _id: new ObjectId(), ...doc };
@@ -84,9 +94,9 @@ class Collection {
 export async function connect() {
   return {
     async collection() {
-      const handle = globalThis.__nis_open();
-      if (handle < 0) throw new Error('nisaba: could not open a collection');
-      return new Collection(handle);
+      const token = globalThis.__nis_open();
+      if (token === null) throw new Error('nisaba: could not open a collection');
+      return new Collection(token);
     },
   };
 }

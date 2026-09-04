@@ -391,3 +391,199 @@ char *fsx_cwd(void) {
     return getcwd(buf, sizeof buf) ? strdup(buf) : NULL;
 #endif
 }
+
+/* ---- what the ported test suite needs ------------------------------------
+ *
+ * See fsx.h. Nothing in the backend proper calls any of this; it exists so
+ * mdy-docs' own tests, which write real directories and build them, can run
+ * against the native target rather than only against node.
+ */
+
+char *fsx_readdir(const char *path) {
+    Buf out = { 0 };
+#ifdef _WIN32
+    size_t need = strlen(path) + 3;
+    char *pattern = malloc(need);
+    if (!pattern) return NULL;
+    snprintf(pattern, need, "%s/*", path);
+    wchar_t *wpattern = win_widen(pattern);
+    free(pattern);
+    if (!wpattern) return NULL;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
+    free(wpattern);
+    if (h == INVALID_HANDLE_VALUE) {
+        /* An empty directory still exists; a missing one does not. */
+        return GetLastError() == ERROR_FILE_NOT_FOUND ? calloc(1, 1) : NULL;
+    }
+    do {
+        char *name = win_narrow(fd.cFileName);
+        if (!name) continue;
+        if (strcmp(name, ".") && strcmp(name, "..")) {
+            buf_put(&out, name, strlen(name));
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) buf_put(&out, "/", 1);
+            buf_put(&out, "\n", 1);
+        }
+        free(name);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(path);
+    if (!d) return NULL;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        buf_put(&out, e->d_name, strlen(e->d_name));
+
+        int is_dir;
+        if (e->d_type == DT_DIR) is_dir = 1;
+        else if (e->d_type == DT_REG) is_dir = 0;
+        else {
+            char *full = at(path, e->d_name);
+            struct stat st;
+            is_dir = full && stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+            free(full);
+        }
+        if (is_dir) buf_put(&out, "/", 1);
+        buf_put(&out, "\n", 1);
+    }
+    closedir(d);
+#endif
+    return out.s ? out.s : calloc(1, 1);
+}
+
+int fsx_mkdirp(const char *path) {
+#ifdef _WIN32
+    /* win_ensure_parent makes everything ABOVE its argument, so name a child
+     * that will never be created to get the directory itself. */
+    size_t need = strlen(path) + 3;
+    char *child = malloc(need);
+    if (!child) return -1;
+    snprintf(child, need, "%s/x", path);
+    int rc = win_ensure_parent(child);
+    free(child);
+    return rc;
+#else
+    char *copy = strdup(path);
+    if (!copy) return -1;
+    int rc = 0;
+    for (char *p = copy + 1; *p && rc == 0; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(copy, 0777) != 0 && errno != EEXIST) rc = -1;
+        *p = '/';
+    }
+    if (rc == 0 && mkdir(copy, 0777) != 0 && errno != EEXIST) rc = -1;
+    free(copy);
+    return rc;
+#endif
+}
+
+/** Is this a directory? Used only to decide how to remove it. */
+static int is_dir_path(const char *path) {
+#ifdef _WIN32
+    wchar_t *w = win_widen(path);
+    if (!w) return 0;
+    DWORD attr = GetFileAttributesW(w);
+    free(w);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static int remove_dir(const char *path) {
+#ifdef _WIN32
+    wchar_t *w = win_widen(path);
+    if (!w) return -1;
+    int rc = RemoveDirectoryW(w) ? 0 : -1;
+    free(w);
+    return rc;
+#else
+    return rmdir(path);
+#endif
+}
+
+int fsx_rm_rf(const char *path) {
+    if (!is_dir_path(path)) {
+        /* A missing path is not an error — this is rm -rf. */
+#ifdef _WIN32
+        wchar_t *w = win_widen(path);
+        if (!w) return -1;
+        int rc = _wunlink(w);
+        free(w);
+        return (rc == 0 || errno == ENOENT) ? 0 : -1;
+#else
+        int rc = unlink(path);
+        return (rc == 0 || errno == ENOENT) ? 0 : -1;
+#endif
+    }
+
+    char *listing = fsx_readdir(path);
+    if (!listing) return 0;
+    int rc = 0;
+    for (char *p = listing, *nl; (nl = strchr(p, '\n')); p = nl + 1) {
+        *nl = '\0';
+        size_t len = strlen(p);
+        if (len && p[len - 1] == '/') p[len - 1] = '\0'; /* the dir marker */
+        char *child = at(path, p);
+        if (!child) { rc = -1; break; }
+        if (fsx_rm_rf(child) != 0) rc = -1;
+        free(child);
+    }
+    free(listing);
+    return rc == 0 ? remove_dir(path) : rc;
+}
+
+char *fsx_mkdtemp(const char *prefix) {
+    /*
+     * Six X's, as mkdtemp wants. Windows has no mkdtemp, so there the name is
+     * built from GetTempFileNameW's uniqueness — it creates a FILE, which is
+     * deleted and replaced with a directory of the same name. That is the
+     * documented way to do this, and the race it leaves is the same one
+     * GetTempFileNameW already has.
+     */
+#ifdef _WIN32
+    (void)prefix;
+    wchar_t dir[MAX_PATH + 1];
+    DWORD n = GetTempPathW(MAX_PATH, dir);
+    if (n == 0 || n > MAX_PATH) return NULL;
+    wchar_t path[MAX_PATH + 1];
+    if (GetTempFileNameW(dir, L"mdy", 0, path) == 0) return NULL;
+    DeleteFileW(path);
+    if (!CreateDirectoryW(path, NULL)) return NULL;
+    char *utf8 = win_narrow(path);
+    if (utf8) for (char *p = utf8; *p; p++) if (*p == '\\') *p = '/';
+    return utf8;
+#else
+    size_t need = strlen(prefix) + 7;
+    char *tmpl = malloc(need);
+    if (!tmpl) return NULL;
+    snprintf(tmpl, need, "%sXXXXXX", prefix);
+    if (!mkdtemp(tmpl)) { free(tmpl); return NULL; }
+    return tmpl;
+#endif
+}
+
+char *fsx_tmpdir(void) {
+#ifdef _WIN32
+    wchar_t dir[MAX_PATH + 1];
+    DWORD n = GetTempPathW(MAX_PATH, dir);
+    if (n == 0 || n > MAX_PATH) return NULL;
+    char *utf8 = win_narrow(dir);
+    if (!utf8) return NULL;
+    for (char *p = utf8; *p; p++) if (*p == '\\') *p = '/';
+    size_t len = strlen(utf8);
+    while (len > 1 && utf8[len - 1] == '/') utf8[--len] = '\0';
+    return utf8;
+#else
+    const char *env = getenv("TMPDIR");
+    if (!env || !*env) env = "/tmp";
+    char *out = strdup(env);
+    size_t len = strlen(out);
+    while (len > 1 && out[len - 1] == '/') out[--len] = '\0';
+    return out;
+#endif
+}

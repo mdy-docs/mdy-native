@@ -20,7 +20,12 @@
  * reported rather than hung on.
  */
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <time.h>
+#ifdef _WIN32
+#  include <windows.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +36,138 @@
 
 static JSContext *g_ctx;
 
+/* ---- timers --------------------------------------------------------------- */
+
+/*
+ * setTimeout, which QuickJS does not have on its own — timers live in
+ * quickjs-libc, and this host deliberately does not link it (see the Makefile:
+ * that is the std/os module layer, and leaving it out leaves out its POSIX
+ * assumptions).
+ *
+ * Two things need them. mdy-docs' test suite has a polling watcher and an
+ * async-native test that both wait on one, and more generally a JavaScript
+ * runtime with no setTimeout will surprise anything that assumes the language
+ * comes with an event loop. So the pump below drains timers as well as jobs:
+ * when no job is ready and a timer is pending, it waits for the earliest and
+ * fires it. That is the whole event loop, and it is enough because nothing
+ * here has I/O to wait on — the filesystem is synchronous C.
+ */
+typedef struct Timer {
+    int64_t id;
+    double due_ms;
+    JSValue fn;
+    struct Timer *next;
+} Timer;
+
+static Timer *g_timers;
+static int64_t g_next_timer_id = 1;
+
+static double now_ms(void) {
+#ifdef _WIN32
+    return (double)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+}
+
+static void sleep_ms(double ms) {
+    if (ms <= 0) return;
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts = { (time_t)(ms / 1000.0), (long)((ms - (long)(ms / 1000.0) * 1000.0) * 1000000.0) };
+    nanosleep(&ts, NULL);
+#endif
+}
+
+static JSValue js_set_timeout(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_NewInt64(ctx, 0);
+    double delay = 0;
+    if (argc > 1) JS_ToFloat64(ctx, &delay, argv[1]);
+
+    Timer *timer = malloc(sizeof *timer);
+    if (!timer) return JS_NewInt64(ctx, 0);
+    timer->id = g_next_timer_id++;
+    timer->due_ms = now_ms() + (delay > 0 ? delay : 0);
+    timer->fn = JS_DupValue(ctx, argv[0]);
+    timer->next = g_timers;
+    g_timers = timer;
+    return JS_NewInt64(ctx, timer->id);
+}
+
+static JSValue js_clear_timeout(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_UNDEFINED;
+    int64_t id = 0;
+    JS_ToInt64(ctx, &id, argv[0]);
+    for (Timer **p = &g_timers; *p; p = &(*p)->next) {
+        if ((*p)->id != id) continue;
+        Timer *dead = *p;
+        *p = dead->next;
+        JS_FreeValue(ctx, dead->fn);
+        free(dead);
+        break;
+    }
+    return JS_UNDEFINED;
+}
+
+/* The earliest pending timer's deadline, or -1 when there are none. */
+static double earliest_timer(void) {
+    double best = -1;
+    for (Timer *t = g_timers; t; t = t->next)
+        if (best < 0 || t->due_ms < best) best = t->due_ms;
+    return best;
+}
+
+/* Fire every timer already due. Returns how many ran. */
+static int fire_due_timers(JSContext *ctx) {
+    int fired = 0;
+    for (;;) {
+        double now = now_ms();
+        Timer **found = NULL;
+        for (Timer **p = &g_timers; *p; p = &(*p)->next) {
+            if ((*p)->due_ms > now) continue;
+            /* Earliest first, so ordering matches what a caller expects. */
+            if (!found || (*p)->due_ms < (*found)->due_ms) found = p;
+        }
+        if (!found) return fired;
+
+        Timer *timer = *found;
+        *found = timer->next;
+        JSValue r = JS_Call(ctx, timer->fn, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(r)) {
+            JSValue e = JS_GetException(ctx);
+            const char *m = JS_ToCString(ctx, e);
+            fprintf(stderr, "mdy-native: a timer threw: %s\n", m ? m : "?");
+            if (m) JS_FreeCString(ctx, m);
+            JS_FreeValue(ctx, e);
+        }
+        JS_FreeValue(ctx, r);
+        JS_FreeValue(ctx, timer->fn);
+        free(timer);
+        fired++;
+    }
+}
+
+/**
+ * One turn of the loop: run a queued job if there is one, otherwise fire a due
+ * timer, otherwise wait for the earliest timer and fire that. Returns 1 if
+ * anything ran, 0 if there is nothing left to do, -1 if a job threw.
+ */
+static int pump(JSRuntime *rt, JSContext *ctx) {
+    JSContext *which = NULL;
+    int ran = JS_ExecutePendingJob(rt, &which);
+    if (ran != 0) return ran;
+    if (fire_due_timers(ctx) > 0) return 1;
+    double due = earliest_timer();
+    if (due < 0) return 0;
+    sleep_ms(due - now_ms());
+    return fire_due_timers(ctx) > 0 ? 1 : 0;
+}
+
 /* ---- waiting for JavaScript ---------------------------------------------- */
 
 static char *settle_to_string(JSContext *ctx, JSValue value, const char **why) {
@@ -38,8 +175,7 @@ static char *settle_to_string(JSContext *ctx, JSValue value, const char **why) {
     JSRuntime *rt = JS_GetRuntime(ctx);
 
     while (JS_PromiseState(ctx, value) == JS_PROMISE_PENDING) {
-        JSContext *which = NULL;
-        int ran = JS_ExecutePendingJob(rt, &which);
+        int ran = pump(rt, ctx);
         if (ran < 0) { *why = "a queued job threw"; return NULL; }
         if (ran == 0) { *why = "promise never settled — nothing left to run"; return NULL; }
     }
@@ -82,18 +218,20 @@ static char *dispatch(const char *name, const char *args_json, void *ud, char **
         JS_FreeValue(g_ctx, answer);
         return NULL;
     }
-    /* On a rejection settle_to_string still hands back the reason's text,
-     * which is the whole diagnostic — "the host rejected" alone says only that
-     * something went wrong somewhere. */
+    /*
+     * A rejection propagates its reason VERBATIM, with no wrapper of our own.
+     * The WASM binding rethrows the error the native threw, and mdy-docs is
+     * written for that: its generated program catches and reports
+     * "document N failed: <reason>". Adding "the host rejected: " here looked
+     * harmless until a cyclic $.render — every level of the recursion added
+     * another copy, and the depth guard's message arrived buried under a
+     * dozen of them.
+     */
     const char *why = NULL;
     char *out = settle_to_string(g_ctx, answer, &why);
     JS_FreeValue(g_ctx, answer);
     if (!out || why) {
-        char buf[640];
-        snprintf(buf, sizeof buf, "%s%s%s", why ? why : "no answer",
-                 out ? ": " : "", out ? out : "");
-        *err = strdup(buf);
-        free(out);
+        *err = out ? out : strdup(why ? why : "the host gave no answer");
         return NULL;
     }
     return out;
@@ -202,9 +340,45 @@ static JSValue js_lam_eval(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     return r;
 }
 
+/*
+ * A COLLECTION HAS A LIFETIME, and this is where it gets one.
+ *
+ * nisaba's JS binding is garbage-collected: a collection nobody references is
+ * reclaimed, and with it the memory or the file handle behind it. Handing back
+ * a bare integer gave up that property, and it showed the moment mdy-docs' own
+ * test suite ran here — a document set per test, hundreds of them, every
+ * handle held forever, and eventually no descriptors left.
+ *
+ * So the handle rides inside a JS object of its own class, and that class has
+ * a finalizer. When the Collection in shims/nisaba.js becomes unreachable, so
+ * does this, and QuickJS closes the collection. The same lifetime the WASM
+ * binding gets, earned rather than assumed.
+ */
+static JSClassID js_nis_class_id;
+
+static void js_nis_finalizer(JSRuntime *rt, JSValue val) {
+    (void)rt;
+    void *p = JS_GetOpaque(val, js_nis_class_id);
+    if (p) nis_close((int)(intptr_t)p - 1);   /* +1 on the way in, so 0 is "none" */
+}
+
+static JSClassDef js_nis_class = {
+    "NisabaCollection",
+    .finalizer = js_nis_finalizer,
+};
+
 static JSValue js_nis_open(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t; (void)argc; (void)argv;
-    return JS_NewInt32(ctx, nis_open());
+    int handle = nis_open();
+    if (handle < 0) return JS_NULL;
+
+    JSValue obj = JS_NewObjectClass(ctx, (int)js_nis_class_id);
+    if (JS_IsException(obj)) { nis_close(handle); return obj; }
+    JS_SetOpaque(obj, (void *)(intptr_t)(handle + 1));
+    /* The number is what every other native takes; the object is what keeps
+     * the collection alive. The shim holds both. */
+    JS_SetPropertyStr(ctx, obj, "handle", JS_NewInt32(ctx, handle));
+    return obj;
 }
 
 static JSValue js_nis_insert(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
@@ -336,6 +510,65 @@ static JSValue js_fs_remove(JSContext *ctx, JSValueConst t, int argc, JSValueCon
     return JS_NewInt32(ctx, rc);
 }
 
+/*
+ * Five more, for the ported test suite only — mdy-docs' own tests write real
+ * directories and build them, which the provider contract never has to do.
+ * See fsx.h.
+ */
+static JSValue js_fs_readdir(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NULL;
+    const char *path = JS_ToCString(ctx, argv[0]);
+    if (!path) return JS_NULL;
+    char *listing = fsx_readdir(path);
+    JS_FreeCString(ctx, path);
+    if (!listing) return JS_NULL;   /* missing — an error for readdir */
+    JSValue out = JS_NewString(ctx, listing);
+    free(listing);
+    return out;
+}
+
+static JSValue js_fs_mkdir(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NewInt32(ctx, -1);
+    const char *path = JS_ToCString(ctx, argv[0]);
+    if (!path) return JS_NewInt32(ctx, -1);
+    int rc = fsx_mkdirp(path);
+    JS_FreeCString(ctx, path);
+    return JS_NewInt32(ctx, rc);
+}
+
+static JSValue js_fs_rm(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NewInt32(ctx, -1);
+    const char *path = JS_ToCString(ctx, argv[0]);
+    if (!path) return JS_NewInt32(ctx, -1);
+    int rc = fsx_rm_rf(path);
+    JS_FreeCString(ctx, path);
+    return JS_NewInt32(ctx, rc);
+}
+
+static JSValue js_fs_mkdtemp(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NULL;
+    const char *prefix = JS_ToCString(ctx, argv[0]);
+    if (!prefix) return JS_NULL;
+    char *made = fsx_mkdtemp(prefix);
+    JS_FreeCString(ctx, prefix);
+    if (!made) return JS_NULL;
+    JSValue out = JS_NewString(ctx, made);
+    free(made);
+    return out;
+}
+
+static JSValue js_fs_tmpdir(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    char *dir = fsx_tmpdir();
+    JSValue out = dir ? JS_NewString(ctx, dir) : JS_NULL;
+    free(dir);
+    return out;
+}
+
 static JSValue js_fs_cwd(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t; (void)argc; (void)argv;
     char *cwd = fsx_cwd();
@@ -380,6 +613,9 @@ int main(int argc, char **argv) {
     JSContext *ctx = JS_NewContext(rt);
     g_ctx = ctx;
 
+    JS_NewClassID(&js_nis_class_id);
+    JS_NewClass(rt, js_nis_class_id, &js_nis_class);
+
     JSValue global = JS_GetGlobalObject(ctx);
     JS_SetPropertyStr(ctx, global, "__lam_vm_new", JS_NewCFunction(ctx, js_lam_vm_new, "__lam_vm_new", 0));
     JS_SetPropertyStr(ctx, global, "__lam_vm_free", JS_NewCFunction(ctx, js_lam_vm_free, "__lam_vm_free", 1));
@@ -394,6 +630,11 @@ int main(int argc, char **argv) {
     JS_SetPropertyStr(ctx, global, "__fs_write", JS_NewCFunction(ctx, js_fs_write, "__fs_write", 3));
     JS_SetPropertyStr(ctx, global, "__fs_remove", JS_NewCFunction(ctx, js_fs_remove, "__fs_remove", 2));
     JS_SetPropertyStr(ctx, global, "__fs_cwd", JS_NewCFunction(ctx, js_fs_cwd, "__fs_cwd", 0));
+    JS_SetPropertyStr(ctx, global, "__fs_readdir", JS_NewCFunction(ctx, js_fs_readdir, "__fs_readdir", 1));
+    JS_SetPropertyStr(ctx, global, "__fs_mkdir", JS_NewCFunction(ctx, js_fs_mkdir, "__fs_mkdir", 1));
+    JS_SetPropertyStr(ctx, global, "__fs_rm", JS_NewCFunction(ctx, js_fs_rm, "__fs_rm", 1));
+    JS_SetPropertyStr(ctx, global, "__fs_mkdtemp", JS_NewCFunction(ctx, js_fs_mkdtemp, "__fs_mkdtemp", 1));
+    JS_SetPropertyStr(ctx, global, "__fs_tmpdir", JS_NewCFunction(ctx, js_fs_tmpdir, "__fs_tmpdir", 0));
 
     /* Everything after the bundle path, so an entry can be told which site to
      * build without a second channel. */
@@ -401,6 +642,12 @@ int main(int argc, char **argv) {
     for (int i = 2, n = 0; i < argc; i++, n++)
         JS_SetPropertyUint32(ctx, args, (uint32_t)n, JS_NewString(ctx, argv[i]));
     JS_SetPropertyStr(ctx, global, "__argv", args);
+
+    JS_SetPropertyStr(ctx, global, "setTimeout", JS_NewCFunction(ctx, js_set_timeout, "setTimeout", 2));
+    JS_SetPropertyStr(ctx, global, "clearTimeout", JS_NewCFunction(ctx, js_clear_timeout, "clearTimeout", 1));
+    /* setInterval is deliberately absent rather than faked: nothing here needs
+     * one, and a repeating timer that never repeats is worse than a missing
+     * function. */
 
     JSValue print_fn = JS_NewCFunction(ctx, js_print, "print", 1);
     JS_SetPropertyStr(ctx, global, "print", JS_DupValue(ctx, print_fn));
@@ -432,8 +679,7 @@ int main(int argc, char **argv) {
      * can have.
      */
     for (;;) {
-        JSContext *which = NULL;
-        int ran = JS_ExecutePendingJob(rt, &which);
+        int ran = pump(rt, ctx);
         if (ran < 0) {
             JSValue e = JS_GetException(ctx);
             const char *m = JS_ToCString(ctx, e);

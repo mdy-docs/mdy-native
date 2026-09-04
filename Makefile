@@ -152,6 +152,11 @@ build/mdy.js: entry.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js shims
 build/site.js: site-entry.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js shims/fs.js
 	node scripts-build.mjs site
 
+# mdy-docs' own suite, bundled to run against this backend. The test files are
+# imported in place from ../../test — not copied — so they cannot drift.
+build/tests.js: tests-entry.mjs scripts-build.mjs $(wildcard shims/node/*.js) $(wildcard ../../test/*.js)
+	node scripts-build.mjs tests
+
 build/bench.js: bench-entry.mjs bench-body.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js
 	node scripts-build.mjs bench
 
@@ -219,7 +224,12 @@ check-golden: build/mdy-native$(EXE) build/site.js
 	done; \
 	exit $$fail
 
-.PHONY: build native site bench clean
+.PHONY: build native site bench test clean
+# The 713 of mdy-docs' 776 tests that a runtime with no subprocesses, no HTTP
+# server and no WebAssembly can run. See tests-entry.mjs for what is left out
+# and why each one is a property of the runtime rather than a gap in the port.
+test: build/mdy-native$(EXE) build/tests.js
+	@./build/mdy-native$(EXE) build/tests.js
 # `make build` rather than `make build/mdy-native`: the target's name carries
 # .exe on Windows, and a caller should not have to know that.
 build: build/mdy-native$(EXE)
