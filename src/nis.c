@@ -19,10 +19,17 @@
 
 #define MAX_COLLECTIONS 8
 
+#define MAX_INDEXES 4
+
 typedef struct {
     int fd;
     bpt *tree;
     dc_collection *coll;
+    /* One extra fd + tree per secondary index — each index is its own B+tree,
+     * so it needs its own backing file. */
+    int index_fds[MAX_INDEXES];
+    bpt *index_trees[MAX_INDEXES];
+    int indexes;
     int used;
 } Slot;
 
@@ -44,15 +51,22 @@ static int32_t io_truncate(void *ctx, uint64_t len) {
     return ftruncate(*(int *)ctx, (off_t)len) < 0 ? -1 : 0;
 }
 
+/** An unlinked temp file: it lives exactly as long as its descriptor, which is
+ * the lifetime `MemoryStorageProvider` promises on the JS side. */
+static int temp_fd(void) {
+    char tmpl[] = "/tmp/mdy-nisaba-XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd >= 0) unlink(tmpl);
+    return fd;
+}
+
 int nis_open(void) {
     int slot = -1;
     for (int i = 0; i < MAX_COLLECTIONS; i++) if (!g_slots[i].used) { slot = i; break; }
     if (slot < 0) return -1;
 
-    char tmpl[] = "/tmp/mdy-nisaba-XXXXXX";
-    int fd = mkstemp(tmpl);
+    int fd = temp_fd();
     if (fd < 0) return -1;
-    unlink(tmpl); /* the collection lives exactly as long as the fd */
 
     g_slots[slot].fd = fd;
     bj_io io = { .ctx = &g_slots[slot].fd, .size = io_size, .read = io_read,
@@ -83,10 +97,36 @@ int nis_find(int handle, const uint8_t *filter, uint32_t filter_len, uint8_t **o
     return dc_find(s->coll, filter, filter_len, NULL, out, out_len) < 0 ? -1 : 0;
 }
 
+int nis_create_index(int handle, const char *name, const uint8_t *fields, uint32_t fields_len,
+                     int unique, int sparse) {
+    Slot *s = slot_of(handle);
+    if (!s || s->indexes >= MAX_INDEXES) return -1;
+
+    int n = s->indexes;
+    s->index_fds[n] = temp_fd();
+    if (s->index_fds[n] < 0) return -1;
+
+    bj_io io = { .ctx = &s->index_fds[n], .size = io_size, .read = io_read,
+                 .write = io_write, .truncate = io_truncate };
+    s->index_trees[n] = bpt_create(&io, 64);
+    if (!s->index_trees[n]) { close(s->index_fds[n]); return -1; }
+
+    /* add_index rather than attach_index: this one is new, so nisaba
+     * backfills it from the documents already inserted. attach_index is for
+     * reopening a collection whose index file already holds the postings. */
+    int rc = dc_collection_add_index(s->coll, name, (int)strlen(name), s->index_trees[n],
+                                     fields, fields_len, unique, sparse, NULL, 0);
+    if (rc != 0) { close(s->index_fds[n]); s->index_trees[n] = NULL; return rc; }
+    s->indexes++;
+    return 0;
+}
+
 void nis_close(int handle) {
     Slot *s = slot_of(handle);
     if (!s) return;
     dc_collection_free(s->coll);
+    for (int i = 0; i < s->indexes; i++) close(s->index_fds[i]);
     close(s->fd);
+    s->indexes = 0;
     s->used = 0;
 }

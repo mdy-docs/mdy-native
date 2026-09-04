@@ -1,0 +1,27 @@
++++
+title: The Tablet House
++++
+% // Everything this build does, it does from here — the entry document decides.
+% // What is being checked is the BOUNDARY, not mdy-docs: every line below
+% // reaches something the native backend had to supply.
+%
+% // A guest ES module, loaded through the engine's module loader. lib/util.js
+% // imports lib/case.js, so the loader is asked twice and the second time by a
+% // module rather than by a document.
+% const util = await import("./lib/util.js")
+%
+% // The query engine, over documents the native filesystem walked up.
+% const cities = $.find({ role: "city" })
+% for (const c of cities) {
+%   const card = $.render({ path: "pages/card.mdy" }, { who: c.who, era: c.era })
+%   $.emit(util.slug(c.who) + "/index.html", card)
+% }
+% $.emit("cities.json", JSON.stringify(cities.map((c) => util.slug(c.who))))
+%
+% // shout() comes from lib/util.js and calls upper() from lib/case.js, so this
+% // one string only exists if a module loaded a module.
+% $.emit("index.html", $.render({ path: "pages/banner.mdy" }, { line: util.shout("built natively"), count: cities.length }))
+
+= {{ res.data.title }}
+
+{{ util.shout("built natively") }} — {{ cities.length }} cities.

@@ -6,58 +6,93 @@ memory ceiling. See [docs/desktop-plan.md](../../docs/desktop-plan.md) —
 "The backend is not a webview" — for the measurements that chose this.
 
 ```sh
-make native   # build both halves and run the checked render
-make bench    # the same 200-document set, native and over WASM in node
+make native            # build both halves, run the checks
+make site SITE=<dir>   # `mdy build`, natively
+make bench             # the same 200-document set, native and over WASM in node
 ```
 
 ## What is here right now
 
-**mdy-docs renders, unmodified, on this backend.** `make native` bundles the
-package with the two engine imports aliased to [shims/](shims/) and runs
-`renderDocumentSet` inside the host:
+**mdy-docs builds a site on this backend, and the output is byte-identical to
+the CLI's.** The reference corpus — 145 source files, an imported style
+package, a JS module graph — comes out as the same 93 pages `mdy build`
+produces, from a 2 MB binary that links no renderer and no node.
 
 ```
---- mdy-native: mdy-docs on QuickJS, engines linked as C ---
+$ diff -r corpus-node corpus-native && echo IDENTICAL
+IDENTICAL
+```
+
+The same is true of `examples/docs-site` (11 pages, guest `import()` included),
+`examples/messaging`, and this package's own [fixture/](fixture/).
+
+`make native` is the test — exit status is the verdict, not a demo:
+
+```
+--- mdy-native: mdy-docs on QuickJS, engines and filesystem in C ---
   ok    the title, from the document's own front matter
   ok    both cities, found by query
   ok    …in the order they were written
   ok    each one through a nested render
+  ok    the provider walks a directory recursively
+  …
+  ok    a guest `import` loaded a JS module
+  ok    …and that module imported its own dependency
+
+all 17 checks passed
 ```
 
-Exit status is the verdict, so this is a test rather than a demo. The four
-checks are chosen to cross every boundary the claim rests on: a `$.find` goes
-guest → host → nisaba and back with a filter; a `$.render` recurses onto a
-second lamassu VM while the first is suspended mid-host-call; and the strings
-carry an em dash and a cuneiform sign, so the UTF-8/UTF-16 round trip through
-both engines is checked rather than assumed.
+Each one crosses a boundary the claim rests on rather than exercising mdy-docs,
+which has 776 tests of its own: a `$.find` goes guest → host → nisaba and back
+with a filter; a `$.render` recurses onto a second lamassu instance while the
+first is suspended mid-host-call; the strings carry an em dash and a cuneiform
+sign, so the UTF-8/UTF-16 round trip through both engines is checked rather
+than assumed; and `buildSite` renders, writes and copies `static/` through a
+filesystem that is five C functions.
 
-Nothing in mdy-docs knows any of this. [entry.mjs](entry.mjs) imports
-`renderDocumentSet` from the package the same way a node build does; the only
-substitution is two esbuild aliases in [scripts-build.mjs](scripts-build.mjs),
-and the shims behind them are 130 lines together.
+Nothing in mdy-docs knows any of this. [entry.mjs](entry.mjs) and
+[site-entry.mjs](site-entry.mjs) import `renderDocumentSet` and `buildSite`
+from the package the same way a node build does; the only substitution is two
+esbuild aliases in [scripts-build.mjs](scripts-build.mjs), and the three shims
+behind them are 260 lines together.
 
 ### What it cost, measured
 
-The same 200-document set — one `$.find` over all of them, each rendered
-through a nested render — both ways, on the same machine:
+Two workloads, because one number would be a lie in either direction. Both on
+the same machine, both against `mdy build` on node with the WASM engines.
 
-|                    | wall  | peak RSS | runtime on disk |
-| ------------------ | ----- | -------- | --------------- |
-| node + WASM engines| 300ms | 138 MB   | ~110 MB (node)  |
-| this               | 314ms | 21 MB    | 1.8 MB stripped |
+|                                   | node   | native | ratio  |
+| --------------------------------- | ------ | ------ | ------ |
+| **reference corpus**, 93 pages    | 10.6 s | 62.5 s | 5.9× slower |
+| peak RSS                          | 816 MB | 593 MB | 1.4× smaller |
+| **200 templates**, `make bench`   | 305 ms | 296 ms | a wash |
+| peak RSS                          | 148 MB | 19 MB  | 7.8× smaller |
+| runtime on disk                   | ~110 MB (node) | 2.0 MB | 55× smaller |
 
-**Time is a wash; memory is 6.6× smaller.** That is a better result than the
-earlier estimate, and the reason is worth stating because it is not obvious.
-QuickJS has no JIT and runs mdy-docs' own JavaScript several times slower than
-V8 — the ingest phase, measured alone on the corpus, was 17.2s against 2.2s.
-But a build of a real document set does not spend its time there: it spends it
-inside lamassu, running templates. Natively that is C rather than WebAssembly,
-and what it gains back is roughly what QuickJS gives up. The two effects very
-nearly cancel.
+The spread between those two rows is the whole story, and it is not noise.
+**QuickJS has no JIT**, and on mdy-docs' own JavaScript it runs several times
+slower than V8. **lamassu is now C rather than WebAssembly**, and there it is
+faster. Which effect wins depends entirely on what a site spends its time
+doing:
 
-The memory number does not cancel, and memory is what this was for. A webview
-build died at page 45 of the corpus against a 1146 MB ceiling; 21 MB against
-138 MB is the same work in a seventh of the space, with no ceiling above it.
+- `make bench` is 200 documents of *templates* — one `$.find`, a nested render
+  each. That is lamassu's work, and native lamassu pays for QuickJS exactly.
+- The corpus is 145 files of long-form *prose*. That is micromark, remark,
+  hast and the MDY front end — JavaScript, all of it — and QuickJS's cost
+  shows through undiluted. A `sample` of the running build is unambiguous:
+  every frame is `JS_CallInternal`, `js_array_flatten`, `js_array_every`,
+  generators. No native call appears at all.
+
+So the honest summary is: **prose-heavy sites are slower here, template-heavy
+sites are not, and both use a fraction of the memory.** If the corpus number
+ever needs to come down, the profile names the target — the MDY front end,
+4,441 lines of our own producing hast directly, measured at 8.8× — and porting
+that one component to C would not cost rehype, since markdown still arrives
+through remark.
+
+Memory is what this was actually for, and it holds on both workloads. A webview
+build died at page 45 of this corpus against a 1146 MB ceiling. This finishes
+all 93, in less space than node, with no ceiling above it.
 
 ### The bridge underneath
 
@@ -175,10 +210,57 @@ without one; the JS binding generates the ObjectId, so a native binding has to.
 That is the same rule met from the other side earlier: nisaba will not accept a
 scalar `_id`, and the primary tree's keys are fixed-width OID bytes.
 
+## The filesystem, and guest `import`
+
+Both were the last structural gaps, and both are now shipped.
+
+**The filesystem** is [src/fsx.c](src/fsx.c) — five POSIX calls, held behind
+[src/fsx.h](src/fsx.h) so nothing from any engine crosses — and
+[shims/fs.js](shims/fs.js), which builds the nine-method contract in
+[../../src/fs-provider.js](../../src/fs-provider.js) on them. The methods are
+`async` because the contract is, not because anything waits.
+
+A listing crosses as ONE newline-separated string, not an array: the corpus is
+thousands of paths, and building that many JSValues to immediately join them is
+work neither side needs. `d_type` is not trusted — several filesystems answer
+`DT_UNKNOWN` from a directory entry, and a walk that believes it silently loses
+whole subtrees, so an unknown falls back to `stat`.
+
+`watch` is absent, deliberately. It is optional at every call site
+(`fs.watch?.(…)`), and a native recursive watcher is kqueue, inotify and
+`ReadDirectoryChangesW` — three implementations, which is the plan's Phase 3
+and not a line to sneak in here. A build does not watch; `mdy dev` does.
+
+**Guest `import`** is `js_set_module_loader` in [src/lam.c](src/lam.c), routed
+out to mdy-docs' own loader (which reads through the provider and enforces the
+package boundary — see `canonicalizeModule` in ../../src/imports.js). Two
+things about it cost a cycle each:
+
+- **Source modules are off by default.** `js_enable_source_modules` is a
+  frontend call, and without it a loader that resolves with source fails at the
+  fetch with "source modules unavailable in this build (precompile to
+  bytecode)". That reads like a missing library and is really a missing line —
+  the split exists so a runtime-only build cannot compile source it is handed,
+  which is a link-time guarantee rather than a policy.
+- **A root spelled with `..` breaks the package boundary check.** imports.js
+  decides a module is inside its package by string prefix, which is the right
+  check; a root of `../../examples/docs-site` then makes every one of that
+  site's own modules look like an escape attempt. The normalisation belongs in
+  the host, where the spelling comes from.
+
+`buildSite` itself now writes through the provider rather than node:fs, so this
+backend runs the CLI's own build function instead of reimplementing it beside
+it. That was a change to mdy-docs, and the 776 tests cover it.
+
+**`$.resize` does not work here, and cannot.** Its image codecs are
+WebAssembly, and QuickJS has none. mdy-docs now says exactly that at the point
+it is true, because the failure otherwise arrived as a missing `node:fs` and
+then again, unrecognisably, as a null tree in whatever page used it.
+
 ## The shims
 
-Two files, and both are short because mdy-docs asks the engines for very
-little. [shims/lamassu.js](shims/lamassu.js) is `createLamassu()` with
+Three files, and all short because mdy-docs asks for very little.
+[shims/lamassu.js](shims/lamassu.js) is `createLamassu()` with
 `eval` / `setNatives` / `setModuleLoader` / `reset`, and it keeps the
 `__hostcall(name, argsJson)` contract exactly as `buildProgram` generates it —
 values could have crossed as values natively, but keeping the JSON means the
@@ -186,9 +268,15 @@ generated program is byte-identical on both backends, and one fewer thing
 differs while both exist. [shims/nisaba.js](shims/nisaba.js) is `connect`, a
 collection, `insertOne`, `find().toArray()` and `createIndex`, with documents
 crossing as binjson encoded by the reference JS codec from nisaba's own
-submodule.
+submodule. [shims/fs.js](shims/fs.js) is the provider above.
 
-Two adaptations worth knowing about, because both were silent failures first:
+Instances are pooled, not made per eval — `createLamassu()` allocates a real
+`JsVm`, as it does over WASM, and `../../src/vm.js`'s pool is what reuses them.
+(Worth recording that this did NOT move the corpus number: creating a VM per
+eval cost about 1% of the build, not the 60 s the profile was hiding. It is
+still the right shape, and it is what `reset()` needs to be honest.)
+
+Adaptations worth knowing about, because each was a silent failure first:
 
 - **`lam_eval` answers with the completion value; `lamassu_eval` answers with a
   transcript** whose completion value is the line after `⇒ `. The latter is the
@@ -201,17 +289,25 @@ Two adaptations worth knowing about, because both were silent failures first:
   "succeeded" and every query came back empty. The class also gives the 24-hex
   `toString` that `src/mdy.js` keys its index map by, so an inserted document
   and a found one agree without either side knowing about the other.
+- **A native that fails must throw INSIDE the sandbox**, which is what the WASM
+  binding does and what mdy-docs' generated program is written for — its
+  try/catch turns it into "document N failed: …". Answering `null` instead
+  turned one legible error into a cascade of unrelated ones about null trees.
+- **`push(...array)` is an argument list**, and every engine caps those. V8
+  allows enough that binjson's encoder looked correct for years; QuickJS stops
+  at 65534, and the corpus has documents with more encoded pieces than that.
+  Fixed in binjson itself — the count is a property of the data, so the only
+  safe number of arguments is one.
 
 ## Next
 
-Two gaps stand between this and building the corpus natively: a filesystem
-provider (the nine methods in [../../src/fs-provider.js](../../src/fs-provider.js),
-over QuickJS's `std`/`os` modules) and a module loader for guest `import()`.
-Neither is structural — the hard parts, async host calls and the two engines in
-one process, are done.
+The backend builds. What it does not yet do is *serve* — Phase 2 and 3 of the
+plan are the editor and watching, and watching is where the missing `watch`
+method and a real change-notification path belong.
 
-Two smaller honesties, both marked in the code. `createIndex` is a no-op: the
-sparse `path` index is an optimisation and a query without it is a scan, so the
-answers are the same and only the timing differs. And `setModuleLoader` does
-nothing, so a document that reaches for guest-side `import()` will fail rather
-than quietly render without it.
+`createIndex` used to be a no-op here and is now real —
+`dc_collection_add_index` with a B+tree of its own, backfilled from what is
+already inserted. That was worth doing and worth measuring: it took the corpus
+from 68.4 s to 62.5 s, and **system time from 9.1 s to 1.7 s**, which is the
+several-hundred full scans per build no longer walking the collection file. It
+did not dent the other 60 seconds, which is exactly what the profile predicted.

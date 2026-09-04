@@ -13,10 +13,17 @@
  * fewer thing differs between the two backends while both exist.
  */
 const natives = new Map(); /* vm id -> the natives installed on it */
-let nextId = 1;
+const loaders = new Map(); /* vm id -> { load, canonicalize } for guest import() */
 
 export function createLamassu() {
-  const id = nextId++;
+  /*
+   * A real instance, not a number: creating one allocates a heap and builds a
+   * global object, which is why src/vm.js pools them. It used to be made and
+   * thrown away inside every eval, and on the reference corpus that was most
+   * of the wall clock.
+   */
+  const id = globalThis.__lam_vm_new();
+  if (id < 0) throw new Error('lamassu: no instance available');
   natives.set(id, {});
   return {
     async eval(program) {
@@ -29,17 +36,45 @@ export function createLamassu() {
       // whose completion value is the line after "⇒ ", and that is the shape
       // src/vm.js reads. So the marker goes back on here rather than vm.js
       // learning which backend it is talking to.
-      return `⇒ ${globalThis.__lam_eval(id, program)}`;
+      //
+      // The third argument says whether a module loader is installed for THIS
+      // eval. Without it the engine gets no loader at all, so a guest `import`
+      // fails at the import rather than resolving to nothing — which is what
+      // src/vm.js means by installing one per eval.
+      return `⇒ ${globalThis.__lam_eval(id, program, loaders.has(id))}`;
     },
     setNatives(next) {
       natives.set(id, next ?? {});
     },
-    setModuleLoader() {
-      /* Guest `import()` is not wired natively yet — no mdy-docs path used by
-       * a build reaches it, and pretending otherwise would hide that. */
+    /*
+     * Per-eval, and cleared by src/vm.js in its `finally` — the pool outlives
+     * any one render, and a loader left installed would answer a later render's
+     * imports from the wrong package root.
+     */
+    setModuleLoader(load, canonicalize) {
+      if (typeof load === 'function') loaders.set(id, { load, canonicalize });
+      else loaders.delete(id);
     },
+    /*
+     * The engine's module registry caches evaluated source per canonical
+     * specifier for the instance's lifetime, and a pooled instance outlives a
+     * render — so without this a watch-mode rebuild after editing a .js module
+     * could be served the stale copy by whichever instance loaded it first.
+     * The registry belongs to the JsVm, and lamassu exposes no way to empty
+     * one, so the instance itself is replaced. Only an eval that actually
+     * loaded a module reaches here (vm.js tracks that), so this is rare.
+     */
     reset() {
       natives.set(id, {});
+      loaders.delete(id);
+      globalThis.__lam_vm_free(id);
+      const fresh = globalThis.__lam_vm_new();
+      if (fresh !== id) {
+        // The host reuses the lowest free slot, so freeing and immediately
+        // reallocating gives the same one back. If it ever does not, the id
+        // this closure captured would name someone else's instance.
+        throw new Error(`lamassu: reset moved instance ${id} to ${fresh}`);
+      }
     },
   };
 }
@@ -60,4 +95,25 @@ globalThis.__lam_dispatch = (id, name, argsJson) => {
   return out && typeof out.then === 'function'
     ? out.then((v) => JSON.stringify(v === undefined ? null : v))
     : JSON.stringify(out === undefined ? null : out);
+};
+
+/*
+ * What the C side calls for a guest `import`. Two operations rather than two
+ * callbacks, matching lam.h: 0 canonicalizes a specifier against its referrer,
+ * 1 loads the canonical specifier's source.
+ *
+ * Raw text both ways, not JSON — a module's source is the payload, and there
+ * is no C-side parser to unwrap it with. Either may return a promise; the host
+ * pumps jobs until it settles, exactly as it does for a host call.
+ */
+globalThis.__lam_module = (id, op, specifier, referrer) => {
+  const loader = loaders.get(id);
+  if (!loader) throw new Error(`no module loader installed for "${specifier}"`);
+  if (op === 0) {
+    // Synchronous by contract: the engine resolves registry identity with the
+    // answer BEFORE dedupe, so it cannot wait for one.
+    return String(loader.canonicalize ? loader.canonicalize(specifier, referrer) : specifier);
+  }
+  const source = loader.load(specifier, referrer);
+  return source && typeof source.then === 'function' ? source.then(String) : String(source);
 };

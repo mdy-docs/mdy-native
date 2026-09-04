@@ -97,10 +97,21 @@ static bool native_ask(JsContext *ctx, JsValue this_val, const JsValue *args, in
         if (aunits) args_json = from_utf16(aunits, alen);
     }
 
-    char *answer = g_ask(name, args_json ? args_json : "[]", g_ask_ud);
+    char *err = NULL;
+    char *answer = g_ask(name, args_json ? args_json : "[]", g_ask_ud, &err);
     free(name);
     free(args_json);
-    if (!answer) return true;
+
+    if (!answer) {
+        /* false with *result = the value to throw — see JsNativeFn in
+         * lamassu.h. The guest's own try/catch is what reads it. */
+        size_t elen = 0;
+        uint16_t *eunits = to_utf16(err ? err : "host call failed", &elen);
+        *result = js_string_new(js_context_vm(ctx), eunits, elen);
+        free(eunits);
+        free(err);
+        return false;
+    }
 
     size_t alen = 0;
     uint16_t *aunits = to_utf16(answer, &alen);
@@ -110,8 +121,128 @@ static bool native_ask(JsContext *ctx, JsValue this_val, const JsValue *args, in
     return true;
 }
 
-char *lam_eval(const char *source, lam_ask_fn ask, void *ud, char **err) {
+/* ---- guest `import` ------------------------------------------------------- */
+
+/*
+ * The module callbacks DO get a user pointer of their own — js_set_module_loader
+ * takes one and hands it back — so unlike the host-call state above, this needs
+ * no global and is re-entrancy-safe by construction. One of these lives on
+ * lam_eval's stack for the duration of the eval.
+ */
+typedef struct {
+    lam_module_fn fn;
+    void *ud;
+    uint16_t *canon;  /* the last canonical specifier, kept alive across the
+                       * call that returned it: the engine copies, but only
+                       * after the callback returns. */
+} ModuleHost;
+
+static bool canon_cb(void *ud, const uint16_t *specifier, size_t spec_len,
+                     const uint16_t *referrer, size_t ref_len,
+                     const uint16_t **out_specifier, size_t *out_spec_len) {
+    ModuleHost *h = ud;
+    if (!h || !h->fn) return false;
+
+    char *spec = from_utf16(specifier, spec_len);
+    char *ref = from_utf16(referrer, ref_len);
+    char *err = NULL;
+    char *canonical = h->fn(LAM_MODULE_CANON, spec, ref, h->ud, &err);
+    free(spec);
+    free(ref);
+    if (!canonical) { free(err); return false; }
+
+    free(h->canon);
+    size_t len = 0;
+    h->canon = to_utf16(canonical, &len);
+    free(canonical);
+    *out_specifier = h->canon;
+    *out_spec_len = len;
+    return true;
+}
+
+static JsValue load_cb(void *ud, JsContext *ctx, const uint16_t *specifier, size_t spec_len,
+                       const uint16_t *referrer, size_t ref_len) {
+    ModuleHost *h = ud;
+    JsValue promise = js_promise_new(ctx);
+
+    char *spec = from_utf16(specifier, spec_len);
+    char *ref = from_utf16(referrer, ref_len);
+    char *err = NULL;
+    char *src = h && h->fn ? h->fn(LAM_MODULE_LOAD, spec, ref, h->ud, &err) : NULL;
+
+    /*
+     * Settled before it is returned. The host side of this is JavaScript and
+     * its answer may be a promise — but host.c pumps QuickJS's job queue until
+     * that settles, exactly as it does for a host call, so by the time control
+     * is back here the source is a string. The guest never learns it waited,
+     * which is the same contract `$.find` runs on.
+     */
+    if (src) {
+        size_t len = 0;
+        uint16_t *units = to_utf16(src, &len);
+        js_resolve(ctx, promise, js_string_new(js_context_vm(ctx), units, len));
+        free(units);
+        free(src);
+    } else {
+        char buf[512];
+        snprintf(buf, sizeof buf, "cannot load module %s: %s", spec, err ? err : "no loader installed");
+        size_t len = 0;
+        uint16_t *units = to_utf16(buf, &len);
+        js_reject(ctx, promise, js_string_new(js_context_vm(ctx), units, len));
+        free(units);
+        free(err);
+    }
+    free(spec);
+    free(ref);
+    return promise;
+}
+
+/* ---- an instance ---------------------------------------------------------- */
+
+struct LamVm {
+    JsVm *vm;
+    JsContext *ctx;
+};
+
+LamVm *lam_vm_new(void) {
+    LamVm *v = calloc(1, sizeof *v);
+    if (!v) return NULL;
+    v->vm = js_vm_new(NULL);
+    if (!v->vm) { free(v); return NULL; }
+    v->ctx = js_context_new(v->vm);
+
+    /* Registered once per instance rather than once per eval: the native's
+     * identity does not change, only the `ask` it forwards to, and that is
+     * stacked around each eval below. */
+    size_t nlen = 0;
+    uint16_t *name = to_utf16("__hostcall", &nlen);
+    js_register_native(v->ctx, name, nlen, native_ask, NULL);
+    free(name);
+
+    /*
+     * Turning SOURCE into a module is a frontend capability and it is off by
+     * default — a runtime-only build links no parser, so "this process cannot
+     * compile source it is handed" is guaranteed by the link rather than by
+     * policy, and even a build that has the parser must ask. Without this a
+     * loader that resolves with source fails at the fetch with "source modules
+     * unavailable in this build (precompile to bytecode)", which reads like a
+     * missing library and is really a missing line.
+     */
+    js_enable_source_modules(v->ctx);
+    return v;
+}
+
+void lam_vm_free(LamVm *v) {
+    if (!v) return;
+    js_vm_free(v->vm);
+    free(v);
+}
+
+char *lam_eval(LamVm *v, const char *source, lam_ask_fn ask, lam_module_fn module,
+               void *ud, char **err) {
     *err = NULL;
+    if (!v) { *err = strdup("lamassu: no vm"); return NULL; }
+    JsContext *ctx = v->ctx;
 
     /*
      * SAVE AND RESTORE, because this is re-entrant: `$.render` is a host call
@@ -129,14 +260,21 @@ char *lam_eval(const char *source, lam_ask_fn ask, void *ud, char **err) {
     g_ask = ask;
     g_ask_ud = ud;
 
-    JsVm *vm = js_vm_new(NULL);
-    if (!vm) { *err = strdup("lamassu: no vm"); g_ask = saved_ask; g_ask_ud = saved_ud; return NULL; }
-    JsContext *ctx = js_context_new(vm);
+    /* Per-eval, and cleared on the way out: an instance outlives any one
+     * render, and a loader left installed would answer a later render's
+     * imports from the wrong package root. Same rule vm.js states. */
+    ModuleHost mod = { .fn = module, .ud = ud, .canon = NULL };
+    js_set_module_loader(ctx, module ? load_cb : NULL, module ? canon_cb : NULL,
+                         module ? &mod : NULL);
 
-    size_t nlen = 0;
-    uint16_t *name = to_utf16("__hostcall", &nlen);
-    js_register_native(ctx, name, nlen, native_ask, NULL);
-    free(name);
+#define LAM_DONE(result)                     \
+    do {                                     \
+        js_set_module_loader(ctx, NULL, NULL, NULL); \
+        free(mod.canon);                     \
+        g_ask = saved_ask;                   \
+        g_ask_ud = saved_ud;                 \
+        return (result);                     \
+    } while (0)
 
     size_t slen = 0;
     uint16_t *src = to_utf16(source, &slen);
@@ -148,19 +286,47 @@ char *lam_eval(const char *source, lam_ask_fn ask, void *ud, char **err) {
         char buf[512];
         snprintf(buf, sizeof buf, "lamassu compile: %s (at %u)", msg, pos);
         *err = strdup(buf);
-        js_vm_free(vm);
-        g_ask = saved_ask;
-        g_ask_ud = saved_ud;
-        return NULL;
+        LAM_DONE(NULL);
     }
 
     JsValue done = js_run_module(ctx, fn);
+
+    /*
+     * A program with no `import` settles inside js_run_module and this loop
+     * does not run. One with an import does not: the loader resolves its
+     * promise, and the module graph only links and evaluates once the
+     * microtask queue drains. js_has_pending_jobs is the termination
+     * condition, so a promise nothing can settle is reported rather than spun
+     * on — the same rule host.c applies to a host call.
+     */
+    while (js_is_promise(done) && js_promise_state(done) == 0) {
+        if (!js_has_pending_jobs(ctx)) break;
+        js_run_jobs(ctx);
+    }
+
+    if (js_is_promise(done) && js_promise_state(done) == 2) {
+        /* A rejection here is a program that threw, or a module that would not
+         * load, and the reason is the only thing that says which. Returning
+         * "no completion value" is how a missing import used to look. */
+        JsValue reason = js_promise_result(done);
+        size_t rlen = 0;
+        const uint16_t *runits = js_string_units(reason, &rlen);
+        char *text = runits ? from_utf16(runits, rlen) : strdup("(non-string rejection)");
+        char buf[640];
+        snprintf(buf, sizeof buf, "lamassu: %s", text);
+        free(text);
+        *err = strdup(buf);
+        LAM_DONE(NULL);
+    }
+    if (js_is_promise(done) && js_promise_state(done) == 0) {
+        *err = strdup("lamassu: the program never settled — nothing left to run");
+        LAM_DONE(NULL);
+    }
+
     JsValue value = js_is_promise(done) ? js_promise_result(done) : done;
     size_t len = 0;
     const uint16_t *units = js_string_units(value, &len);
     char *out = units ? from_utf16(units, len) : strdup("(no string completion value)");
-    js_vm_free(vm);
-    g_ask = saved_ask;
-    g_ask_ud = saved_ud;
-    return out;
+    LAM_DONE(out);
+#undef LAM_DONE
 }

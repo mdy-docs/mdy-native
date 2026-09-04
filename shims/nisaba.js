@@ -57,9 +57,28 @@ class Collection {
     };
   }
 
-  /* The sparse path index is an optimisation, not a semantic: without it a
-   * query is a scan and the answers are the same. Honest no-op for now. */
-  async createIndex() { return 'noop'; }
+  /*
+   * A real secondary index, backfilled from what is already inserted. The
+   * field spec crosses as a binjson ARRAY of names — the same marshalling the
+   * WASM binding does, so the shape does not depend on the backend.
+   *
+   * Ascending only, matching that binding: descending changes scan direction
+   * and nothing else, and a caller can reverse the results.
+   */
+  async createIndex(keys, options = {}) {
+    const fields = Object.keys(keys ?? {});
+    if (fields.length === 0) throw new Error('createIndex requires at least one field');
+    for (const f of fields) {
+      if (keys[f] !== 1) throw new Error(`createIndex: only ascending (1) fields are supported (got ${f}: ${keys[f]})`);
+    }
+    const name = options.name ?? fields.map((f) => `${f}_1`).join('_');
+    const rc = globalThis.__nis_index(
+      this.handle, name, bufferOf(encode(fields)),
+      Boolean(options.unique), Boolean(options.sparse)
+    );
+    if (rc !== 0) throw new Error(`nisaba: createIndex ${name} refused (rc=${rc})`);
+    return name;
+  }
 }
 
 export async function connect() {
