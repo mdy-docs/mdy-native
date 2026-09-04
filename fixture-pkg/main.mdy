@@ -1,0 +1,17 @@
++++
+title: Imported Style
++++
+% // The case Windows is most likely to break: a package imported by relative
+% // path, whose layouts and JS modules resolve against ITS directory and not
+% // this one. imports.js decides "inside the package" by string prefix on an
+% // absolute path, so a drive letter or a backslash anywhere in that chain
+% // shows up here as a wrong answer rather than an error.
+% import style from "../fixture-style"
+%
+% for (const p of $.find({ role: "page" })) {
+%   const body = $.render({ path: "pages/" + p.slug + ".mdy" })
+%   $.emit(p.slug + "/index.html", style.render({ path: "layouts/page.mdy" }, { title: p.title, content: body }))
+% }
+% $.emit("index.html", style.render({ path: "layouts/page.mdy" }, { title: res.data.title, content: "" }))
+
+= {{ res.data.title }}

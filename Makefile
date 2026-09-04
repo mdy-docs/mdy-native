@@ -166,15 +166,44 @@ OUT  ?= build/site-out
 # check the native backend byte-for-byte on a platform where node cannot run
 # the build at all (it needs the WASM engines, which are emscripten build
 # products and are not in git). See golden/README.md.
-GOLDEN_SITES := fixture ../../examples/docs-site ../../examples/messaging
+# DETERMINISTIC SITES ONLY, and that is checked rather than assumed — build,
+# touch every source, build again, diff. examples/docs-site is NOT here for
+# exactly that reason: it renders a source file's mtime, and a git checkout
+# sets mtimes to checkout time, so its output can never match a committed
+# reference. `make check-determinism` is the test.
+#
+# fixture-pkg earns its place: it imports a PACKAGE, so its layouts and JS
+# modules resolve against that package's directory rather than the site's.
+# That is the case Windows is most likely to get wrong, because imports.js
+# decides "inside the package" by string prefix on an absolute path.
+GOLDEN_SITES := fixture fixture-pkg ../../examples/messaging
 
-.PHONY: golden check-golden
+.PHONY: golden check-golden check-determinism
 golden:
-	@rm -rf golden/fixture golden/docs-site golden/messaging
+	@rm -rf golden/fixture golden/fixture-pkg golden/messaging
 	@for d in $(GOLDEN_SITES); do \
 	  node ../../bin/mdy.js build $$d --out golden/`basename $$d` > /dev/null || exit 1; \
 	done
 	@echo "regenerated golden/ — read the diff before committing it"
+
+# A golden site whose output moves is worse than no golden site: it goes red
+# for a reason that is not a regression. This proves each one is stable across
+# the thing a git checkout actually changes — every file's mtime.
+check-determinism: build/mdy-native$(EXE) build/site.js
+	@bin=./build/mdy-native$(EXE); fail=0; \
+	for d in $(GOLDEN_SITES); do \
+	  n=`basename $$d`; \
+	  rm -rf build/det-$$n-a build/det-$$n-b; \
+	  $$bin build/site.js $$d build/det-$$n-a > /dev/null || exit 1; \
+	  find $$d -type f -exec touch {} \; ; \
+	  $$bin build/site.js $$d build/det-$$n-b > /dev/null || exit 1; \
+	  if diff -r build/det-$$n-a build/det-$$n-b > /dev/null; then \
+	    echo "  $$n: stable across an mtime change"; \
+	  else \
+	    echo "  $$n: OUTPUT MOVES — it cannot be a golden site"; fail=1; \
+	  fi; \
+	done; \
+	exit $$fail
 
 check-golden: build/mdy-native$(EXE) build/site.js
 	@bin=./build/mdy-native$(EXE); fail=0; \

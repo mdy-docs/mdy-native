@@ -1,0 +1,11 @@
+% // A module belonging to the PACKAGE, imported from inside the package. Its
+% // specifier resolves against fixture-style/, not against the importing site
+% // — which is the whole point of the check: imports.js decides "inside the
+% // package" by string prefix on an absolute path, so a drive letter or a
+% // backslash anywhere in that chain shows up here as a wrong answer rather
+% // than an error.
+% const fmt = await import("../lib/fmt.js")
+
+= {{ fmt.headline(req.title) }}
+
+{{ req.content }}
