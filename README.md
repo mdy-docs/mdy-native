@@ -11,6 +11,13 @@ make site SITE=<dir>   # `mdy build`, natively
 make bench             # the same 200-document set, native and over WASM in node
 ```
 
+Everything is built from source and nothing comes from a system package:
+QuickJS is a submodule, lamassu and nisaba are the parent's. macOS, Linux and
+Windows are all built by
+[.github/workflows/native.yml](../../.github/workflows/native.yml) on every
+push — Windows through MSYS2/mingw-w64, which is a configuration QuickJS's own
+Makefile supports.
+
 ## What is here right now
 
 **mdy-docs builds a site on this backend, and the output is byte-identical to
@@ -125,12 +132,29 @@ else, `host.c` includes QuickJS and nothing else, and [src/lam.h](src/lam.h) is
 the only header both see — it names no type belonging to either. That is the
 right shape regardless; the collision only forced it sooner.
 
-**Symbols cannot meet either.** Both define `js_dtoa`. lamassu's is internal —
-not in `lamassu.h` — so the Makefile pre-links its two archives into one object
-with that symbol made local, and each engine then resolves its own. On this
-toolchain `ld -r` also needs an explicit `-arch`, or it asserts inside an
-Objective-C pass with "unknown objc arch", which is an ld64 bug and not
-something you did.
+**Symbols cannot meet either — and the first fix for that was wrong.** Both
+engines defined `js_dtoa`, and the original answer was to pre-link lamassu's
+two archives into one object with `ld -r -all_load -unexported_symbol
+_js_dtoa`, making the symbol local. That works, and it is ld64-only, so it
+quietly made macOS the one platform this could be built on.
+
+lamassu's `js_dtoa` is `static` now (52f0bfd), and the archives link directly.
+Comparing the two symbol tables afterwards said how small the real problem was:
+181 exports against 273, and `js_dtoa` was the only name in common.
+
+**But the pre-link was hiding something worse.** nisaba vendors
+`mdy-docs/regex-engine`; lamassu has moved to `mdy-docs/baru-re`, its successor
+— same ancestry, *different version*. Four internal names collide. Because
+`ld -r` loads every symbol unconditionally while an archive is pulled on
+demand, nisaba's `regexp.o` was never pulled at all, and any call it made to
+one of those four resolved to **lamassu's differently versioned
+implementation**. No error, no warning.
+
+They are renamed at compile time now (see `NIS_RENAME` in the Makefile), which
+keeps each engine's calls inside its own engine and turns any new overlap into
+a duplicate-symbol error rather than a new silent binding. The real fix is for
+nisaba to use baru-re as well, so the binary holds one regex engine instead of
+two.
 
 ## Async host calls — the hard part, and it works
 
@@ -232,10 +256,26 @@ whole subtrees, so an unknown falls back to `stat`.
 and not a line to sneak in here. A build does not watch; `mdy dev` does.
 
 Everything else here is portable by accident of where the seams already were:
-lamassu and nisaba contain no platform `#ifdef`s at all, so [fsx.c](src/fsx.c)
-and [nis.c](src/nis.c) — 361 lines — are the entire surface that knows which
-operating system this is. Adding Windows means a second version of those two
-files and nothing else. See the plan's Phase 4.
+lamassu and nisaba contain no platform `#ifdef`s at all, so [fsx.c](src/fsx.c),
+[nis.c](src/nis.c) and [oswin.c](src/oswin.c) are the entire surface that knows
+which operating system this is. Windows was a second version of those and
+nothing else — `FindFirstFileW` for the walk, `OVERLAPPED` for `pread`/`pwrite`
+(Windows has no positioned read; the offset rides in the OVERLAPPED, which is
+how you keep the "does not disturb the file pointer" guarantee),
+`SetEndOfFile`, and `FILE_FLAG_DELETE_ON_CLOSE` for the collection's backing
+file — the same self-deleting lifetime `mkstemp` + `unlink` gives.
+
+Two rules hold that together, and both are load-bearing:
+
+- **Paths cross this boundary as UTF-8, and every Win32 call is the wide
+  variant.** The narrow entry points go through the process code page, which
+  cannot spell most of what the reference corpus is named.
+- **`/` is the separator everywhere.** Win32 accepts it in every path it is
+  given, so the only place a backslash can enter is `fsx_cwd`, where the OS
+  hands one back — and it is translated there rather than in every place it
+  would otherwise surface. This matters more than it looks: `src/imports.js`
+  decides a module is inside its package by string prefix, so two spellings of
+  one path are two packages.
 
 **Guest `import`** is `js_set_module_loader` in [src/lam.c](src/lam.c), routed
 out to mdy-docs' own loader (which reads through the provider and enforces the
