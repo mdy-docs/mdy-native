@@ -12,11 +12,24 @@ make bench             # the same 200-document set, native and over WASM in node
 ```
 
 Everything is built from source and nothing comes from a system package:
-QuickJS is a submodule, lamassu and nisaba are the parent's. macOS, Linux and
-Windows are all built by
-[.github/workflows/native.yml](../../.github/workflows/native.yml) on every
-push — Windows through MSYS2/mingw-w64, which is a configuration QuickJS's own
-Makefile supports.
+QuickJS is a submodule, lamassu and nisaba are the parent's.
+
+**macOS, Linux and Windows all build and produce byte-identical output**, on
+every push, via [.github/workflows/native.yml](../../.github/workflows/native.yml):
+
+```
+success  macOS      success  Linux      success  Windows
+  all 17 checks passed
+  fixture: identical to golden
+  fixture-pkg: identical to golden
+  messaging: identical to golden
+```
+
+Windows through MSYS2/mingw-w64 — a configuration QuickJS's own Makefile
+supports (it has an `MSYSTEM` branch), which is why this is mingw and not MSVC.
+Bellard's QuickJS does not build under MSVC at all; getting it would mean
+switching to the `quickjs-ng` fork, and that is a larger decision than a build
+system should make on its own.
 
 ## What is here right now
 
@@ -234,6 +247,50 @@ without one; the JS binding generates the ObjectId, so a native binding has to.
 That is the same rule met from the other side earlier: nisaba will not accept a
 scalar `_id`, and the primary tree's keys are fixed-width OID bytes.
 
+## Three platforms
+
+The only files that know which operating system this is are
+[fsx.c](src/fsx.c), [nis.c](src/nis.c) and [oswin.c](src/oswin.c). Both engines
+are platform-clean — lamassu has no `#ifdef`s at all, and nisaba's I/O sits
+behind its four `bj_io` callbacks — so Windows was a second version of those
+and nothing else: `FindFirstFileW` for the walk, `OVERLAPPED` for
+`pread`/`pwrite` (Windows has no positioned read; the offset rides in the
+OVERLAPPED, which is how the "does not disturb the file pointer" guarantee
+survives), `SetEndOfFile`, and `FILE_FLAG_DELETE_ON_CLOSE` for the collection's
+backing file — the same self-deleting lifetime `mkstemp` + `unlink` gives.
+
+Two rules hold it together and both are load-bearing:
+
+- **Paths cross this boundary as UTF-8, and every Win32 call is the wide
+  variant.** The narrow entry points go through the process code page, which
+  cannot spell most of what the reference corpus is named.
+- **`/` is the separator everywhere.** Win32 accepts it in every path it is
+  given, so the only place a backslash can enter is `fsx_cwd`, where the OS
+  hands one back — and it is translated there rather than in every place it
+  would otherwise surface. This matters more than it looks: `src/imports.js`
+  decides a module is inside its package by string prefix, so two spellings of
+  one path are two packages. `golden/fixture-pkg` is the test for it.
+
+The drive letter needs handling in exactly two places, both found by reasoning
+rather than by a red build: `at()` in fsx.c, where an absolute `rel` under a
+root of `/` would otherwise produce `/C:/Users/…`, and `site-entry.mjs`, where
+`C:/work` would otherwise be treated as relative and have the cwd prepended.
+
+Three things CI found that reasoning had not:
+
+- **glibc hides POSIX declarations under `-std=c11`.** `strdup` came back as an
+  implicit declaration and `st_mtim` as an unknown field — both fine on macOS,
+  which exposes them regardless. `gnu11` now.
+- **`npm install` runs node-gyp on Windows and fails** for want of Visual
+  Studio: `@mdy-docs/nisaba-db` → `node-opfs` → `fs-ext` carries a
+  `binding.gyp`. Nothing on the native path uses it, so CI installs with
+  `--ignore-scripts`; node is here only to run esbuild, which resolves its
+  platform binary from optionalDependencies and needs no install script.
+- **Line endings are build output.** `static/` is a verbatim passthrough, so a
+  stylesheet checked out with CRLF is emitted with CRLF, and Windows runners
+  default to `core.autocrlf=true`. `.gitattributes` marks everything whose
+  bytes reach the output, and the output itself, as `-text`.
+
 ## The filesystem, and guest `import`
 
 Both were the last structural gaps, and both are now shipped.
@@ -255,27 +312,7 @@ whole subtrees, so an unknown falls back to `stat`.
 `ReadDirectoryChangesW` — three implementations, which is the plan's Phase 3
 and not a line to sneak in here. A build does not watch; `mdy dev` does.
 
-Everything else here is portable by accident of where the seams already were:
-lamassu and nisaba contain no platform `#ifdef`s at all, so [fsx.c](src/fsx.c),
-[nis.c](src/nis.c) and [oswin.c](src/oswin.c) are the entire surface that knows
-which operating system this is. Windows was a second version of those and
-nothing else — `FindFirstFileW` for the walk, `OVERLAPPED` for `pread`/`pwrite`
-(Windows has no positioned read; the offset rides in the OVERLAPPED, which is
-how you keep the "does not disturb the file pointer" guarantee),
-`SetEndOfFile`, and `FILE_FLAG_DELETE_ON_CLOSE` for the collection's backing
-file — the same self-deleting lifetime `mkstemp` + `unlink` gives.
-
-Two rules hold that together, and both are load-bearing:
-
-- **Paths cross this boundary as UTF-8, and every Win32 call is the wide
-  variant.** The narrow entry points go through the process code page, which
-  cannot spell most of what the reference corpus is named.
-- **`/` is the separator everywhere.** Win32 accepts it in every path it is
-  given, so the only place a backslash can enter is `fsx_cwd`, where the OS
-  hands one back — and it is translated there rather than in every place it
-  would otherwise surface. This matters more than it looks: `src/imports.js`
-  decides a module is inside its package by string prefix, so two spellings of
-  one path are two packages.
+See "Three platforms" above for how the rest of it reaches Windows.
 
 **Guest `import`** is `js_set_module_loader` in [src/lam.c](src/lam.c), routed
 out to mdy-docs' own loader (which reads through the provider and enforces the
