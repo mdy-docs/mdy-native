@@ -1,42 +1,81 @@
-# mdy-native — the backend as a binary: QuickJS for mdy-docs' own JavaScript,
-# lamassu (and later nisaba) linked as C rather than loaded as WebAssembly.
+# mdy-native — the backend as a binary: mdy-docs' own JavaScript in QuickJS,
+# with lamassu and nisaba linked as C rather than loaded as WebAssembly.
 # See ../../docs/desktop-plan.md.
+#
+#   make native            build both halves and run the checks
+#   make site SITE=<dir>   `mdy build`, natively
+#   make bench             the same document set, native and over WASM in node
+#
+# PORTABILITY. Everything here is plain C with no dependency on a system
+# package: QuickJS is a submodule built from source, and lamassu and nisaba are
+# submodules of the parent. The only files that know which operating system
+# this is are src/fsx.c and src/nis.c, because both engines are platform-clean
+# — lamassu has no #ifdefs at all and nisaba's I/O is behind its bj_io
+# callbacks. See docs/desktop-plan.md, Phase 4.
+
 NISABA  ?= ../../third_party/nisaba-db
-QUICKJS ?= /usr/local/Cellar/quickjs/2026-06-04/
 LAMASSU ?= ../../third_party/lamassu-js
+QUICKJS ?= third_party/quickjs
 
-CFLAGS  += -std=c11 -Wall -Wextra -O2 -g -I$(LAMASSU)/include -I$(QUICKJS)include/quickjs
+CFLAGS  += -std=c11 -Wall -Wextra -O2 -g -I$(LAMASSU)/include -I$(QUICKJS)
+LDLIBS  += -lm
 
+# Windows has no libpthread of its own and mingw's winpthreads is not needed:
+# nothing here starts a thread. Elsewhere QuickJS wants it.
+ifeq ($(OS),Windows_NT)
+  EXE := .exe
+else
+  LDLIBS += -lpthread
+  EXE :=
+endif
 
-# lamassu and QuickJS share the `js_` namespace, and not only in headers:
-# both define js_dtoa. lamassu's is internal — it is not in lamassu.h — so the
-# two archives are pre-linked into one object with that symbol made local.
-# Each engine then resolves its own, which is what both expect.
-build/lamassu.o: $(LAMASSU)/build/liblamassu_frontend.a $(LAMASSU)/build/liblamassu_runtime.a
-	@mkdir -p build
-	ld -r -arch x86_64 -o $@ -all_load $^ -unexported_symbol _js_dtoa
+# ---- QuickJS --------------------------------------------------------------
+#
+# Built from its own sources rather than linked from a system package, so the
+# build is identical on every platform and pinned to one commit. quickjs-libc
+# is deliberately NOT here: it is the `std`/`os` module layer, and this host
+# supplies its own natives (see src/host.c). Leaving it out also leaves out its
+# POSIX assumptions, which is most of what would need porting.
+QJS_SRCS := $(QUICKJS)/quickjs.c $(QUICKJS)/dtoa.c $(QUICKJS)/libregexp.c \
+            $(QUICKJS)/libunicode.c $(QUICKJS)/cutils.c
+QJS_OBJS := $(patsubst $(QUICKJS)/%.c,build/qjs/%.o,$(QJS_SRCS))
 
-build/bridge: src/host.c src/lam.c src/lam.h build/lamassu.o
-	@mkdir -p build
-	$(CC) $(CFLAGS) -Isrc src/host.c src/lam.c build/lamassu.o -o $@ \
-	  $(QUICKJS)lib/quickjs/libquickjs.a -lm -lpthread
+# gnu11, not c11: quickjs.c uses `asm volatile` in its spin hint, which strict
+# C hides behind __asm__. `-w` rather than a clang-specific -Wno-everything —
+# this has to compile under gcc and mingw too, and QuickJS is third-party code
+# that does not build clean under our warning set.
+build/qjs/%.o: $(QUICKJS)/%.c
+	@mkdir -p build/qjs
+	$(CC) -std=gnu11 -O2 -DCONFIG_VERSION='"mdy-native"' -w -c $< -o $@
 
-.PHONY: run clean
-run: build/bridge
-	@./build/bridge
-clean:
-	rm -rf build
+build/libquickjs.a: $(QJS_OBJS)
+	$(AR) rcs $@ $(QJS_OBJS)
 
-# ---- nisaba, built natively ----------------------------------------------
+# ---- lamassu --------------------------------------------------------------
+#
+# Its two archives link directly now. They used to need a pre-link pass
+# (`ld -r -all_load -unexported_symbol _js_dtoa`) because both engines defined
+# js_dtoa — ld64-only, which made macOS the one platform this could be done on
+# at all. lamassu's is `static` as of 52f0bfd, and a symbol-table comparison
+# says that was the only name the two archives had in common: 181 exports
+# against 273, one overlap.
+LAM_LIBS := $(LAMASSU)/build/liblamassu_runtime.a $(LAMASSU)/build/liblamassu_frontend.a
+
+$(LAM_LIBS):
+	$(MAKE) -C $(LAMASSU) libs
+
+# ---- nisaba ---------------------------------------------------------------
 #
 # All of nisaba's C compiles with cc and no changes — including the files named
-# *_wasm.c, whose EMSCRIPTEN_KEEPALIVE is a no-op off-target. db_wasm.c is the
-# one genuine exception: it is the WASM export layer, and a native host is what
+# *_wasm.c, whose EMSCRIPTEN_KEEPALIVE is a no-op off-target and one of which
+# holds the regex entry points rather than mere exports. db_wasm.c is the one
+# genuine exception: it is the WASM export layer, and a native host is what
 # replaces it.
 #
-# Its storage is not: `bjio_host(fd)` reaches into Module.bjioHandles, a table
-# of JS FileSystemSyncAccessHandle objects. bj_io is four callbacks, so a
-# native host supplies its own (see src/nis_probe.c).
+# Its storage is not portable either, and that is the seam working:
+# `bjio_host(fd)` reaches into Module.bjioHandles, a table of JS
+# FileSystemSyncAccessHandle objects. bj_io is four callbacks, so a native host
+# supplies its own — see src/nis.c.
 NIS_SRCS := \
   $(NISABA)/wasm/src/db_keyenc.c $(NISABA)/wasm/src/regex.c \
   $(NISABA)/wasm/src/db_query.c $(NISABA)/wasm/src/db_update.c $(NISABA)/wasm/src/db.c \
@@ -57,32 +96,51 @@ NIS_INC := -I$(NISABA)/wasm/include -I$(NISABA)/third_party/binjson/include \
            -I$(NISABA)/third_party/binjson-structures/include \
            -I$(NISABA)/third_party/regex-engine/include
 
+# TWO REGEX ENGINES IN ONE BINARY, and they are not the same code.
+#
+# nisaba vendors mdy-docs/regex-engine; lamassu has moved to mdy-docs/baru-re,
+# which is its successor — same ancestry, different version (baru-re 0.5.0 lets
+# the embedder supply the allocator, among other things). Neither prefixes its
+# symbols, so four names are defined by both: an exact-duplicate link error.
+#
+# This is worth understanding rather than papering over, because the previous
+# build DID paper over it. It pre-linked lamassu into one relocatable object
+# with `ld -r -all_load`, which loads every symbol unconditionally, and then
+# offered nisaba as an archive — so nisaba's regexp.o was simply never pulled,
+# and any call it made to one of these four resolved to LAMASSU's differently
+# versioned implementation. Silent, and the wrong kind of wrong.
+#
+# Renaming nisaba's four at compile time keeps each engine's calls inside its
+# own engine, needs no change to either upstream, and works on every compiler.
+# It also fails LOUDLY if the overlap ever grows: a new shared name is a new
+# duplicate-symbol error, not a new silent binding.
+#
+# The real fix is for nisaba to use baru-re too, so there is one regex engine
+# in the binary instead of two. That is an API migration and it is noted in
+# docs/desktop-plan.md rather than done here.
+NIS_RENAME := -Dcompile_into=nis_re_compile_into -Dparse_alt=nis_re_parse_alt \
+              -Dvm_execute_internal=nis_re_vm_execute_internal \
+              -Dvm_get_indices=nis_re_vm_get_indices
+
 build/libnisaba.a: $(NIS_SRCS)
 	@mkdir -p build/nis
 	@for f in $(NIS_SRCS); do \
-	  $(CC) -std=c11 -O2 $(NIS_INC) -c $$f -o build/nis/`basename $$f .c`.o || exit 1; \
+	  $(CC) -std=c11 -O2 $(NIS_INC) $(NIS_RENAME) -c $$f -o build/nis/`basename $$f .c`.o || exit 1; \
 	done
-	ar rcs $@ build/nis/*.o
-
-build/nis_probe: src/nis_probe.c build/libnisaba.a
-	@mkdir -p build
-	$(CC) -std=c11 -O2 -D_GNU_SOURCE $(NIS_INC) src/nis_probe.c build/libnisaba.a -o $@ -lm
-
-.PHONY: nisaba
-nisaba: build/nis_probe
-	@./build/nis_probe
+	$(AR) rcs $@ build/nis/*.o
 
 # ---- the backend ----------------------------------------------------------
-#
-# Everything at once: mdy-docs' own JavaScript in QuickJS, both engines linked
-# as C beneath it. build/mdy.js is the bundle (`node scripts-build.mjs`), with
-# the two engine packages aliased to shims/ that call the natives below.
-build/mdy-native: src/host.c src/lam.c src/nis.c src/fsx.c src/lam.h src/nis.h src/fsx.h build/lamassu.o build/libnisaba.a
-	@mkdir -p build
-	$(CC) $(CFLAGS) -D_GNU_SOURCE -Isrc $(NIS_INC) \
-	  src/host.c src/lam.c src/nis.c src/fsx.c build/lamassu.o build/libnisaba.a -o $@ \
-	  $(QUICKJS)lib/quickjs/libquickjs.a -lm -lpthread
 
+HOST_SRCS := src/host.c src/lam.c src/nis.c src/fsx.c src/oswin.c
+HOST_HDRS := src/lam.h src/nis.h src/fsx.h src/oswin.h
+
+build/mdy-native$(EXE): $(HOST_SRCS) $(HOST_HDRS) build/libquickjs.a build/libnisaba.a $(LAM_LIBS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(HOST_SRCS) \
+	  build/libnisaba.a $(LAM_LIBS) build/libquickjs.a -o $@ $(LDLIBS)
+
+# build/mdy.js is the bundle: mdy-docs through esbuild with the two engine
+# imports aliased to shims/. See scripts-build.mjs.
 build/mdy.js: entry.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js shims/fs.js
 	node scripts-build.mjs
 
@@ -92,20 +150,21 @@ build/site.js: site-entry.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js
 build/bench.js: bench-entry.mjs bench-body.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js
 	node scripts-build.mjs bench
 
-# `make site SITE=../../examples/blog OUT=/tmp/blog` — the CLI's own build
+# `make site SITE=../../examples/docs-site OUT=/tmp/out` — the CLI's own build
 # path, run natively.
 SITE ?= fixture
 OUT  ?= build/site-out
 
-.PHONY: native bench site
-native: build/mdy-native build/mdy.js
-	@./build/mdy-native build/mdy.js
+.PHONY: native site bench clean
+native: build/mdy-native$(EXE) build/mdy.js
+	@./build/mdy-native$(EXE) build/mdy.js
 
-# The same 200-document set both ways. `node` is mdy-docs over the WASM
-# engines; `native` is this. See README.md for what the numbers said.
-site: build/mdy-native build/site.js
-	@./build/mdy-native build/site.js $(SITE) $(OUT)
+site: build/mdy-native$(EXE) build/site.js
+	@./build/mdy-native$(EXE) build/site.js $(SITE) $(OUT)
 
-bench: build/mdy-native build/bench.js
-	@/usr/bin/time -l ./build/mdy-native build/bench.js 2>&1 | grep -E "native:|maximum resident"
+bench: build/mdy-native$(EXE) build/bench.js
+	@/usr/bin/time -l ./build/mdy-native$(EXE) build/bench.js 2>&1 | grep -E "native:|maximum resident"
 	@/usr/bin/time -l node bench-node.mjs 2>&1 | grep -E "node:|maximum resident"
+
+clean:
+	rm -rf build

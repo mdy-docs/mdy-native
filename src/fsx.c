@@ -2,13 +2,22 @@
  * The filesystem half. POSIX and nothing else — see fsx.h for the contract
  * and for why this is not called fs.c.
  */
-#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#  include <windows.h>
+#  include <direct.h>   /* _wgetcwd */
+#  include <wchar.h>    /* _wfopen */
+#  include <sys/types.h>
+#  include "oswin.h"
+#else
+#  include <dirent.h>
+#  include <unistd.h>
+#endif
 
 #include "fsx.h"
 
@@ -65,7 +74,88 @@ static int matches(const char *name, const char *exts) {
     return 0;
 }
 
+/*
+ * fopen / stat / unlink / getcwd, but never through Win32's narrow entry
+ * points. Those go via the process code page, and the reference corpus is full
+ * of names the code page cannot spell — so on Windows each of these widens the
+ * UTF-8 path and calls the wide variant. This is the whole reason a `_WIN32`
+ * branch exists at file level rather than only around the directory walk.
+ */
+#ifdef _WIN32
+
+static FILE *open_utf8(const char *path, const wchar_t *mode) {
+    wchar_t *w = win_widen(path);
+    if (!w) return NULL;
+    FILE *f = _wfopen(w, mode);
+    free(w);
+    return f;
+}
+#  define FSX_FOPEN_R(p) open_utf8((p), L"rb")
+#  define FSX_FOPEN_W(p) open_utf8((p), L"wb")
+
+#else
+#  define FSX_FOPEN_R(p) fopen((p), "rb")
+#  define FSX_FOPEN_W(p) fopen((p), "wb")
+#endif
+
 /* ---- listing -------------------------------------------------------------- */
+
+#ifdef _WIN32
+
+/*
+ * The walk, over FindFirstFileW. Windows has no readdir, and the pattern is
+ * appended to the directory rather than passed separately — `dir\*` — so this
+ * builds one wide string per level.
+ *
+ * FindFirstFileW answers ERROR_FILE_NOT_FOUND for an empty directory and
+ * ERROR_PATH_NOT_FOUND for a missing one, and both are an empty listing to the
+ * caller: the contract says a missing directory is [], and a site importing a
+ * package with no static/ depends on it.
+ */
+static int walk(const char *base, const char *rel, const char *exts, Buf *out) {
+    char *dir = at(base, rel);
+    if (!dir) return -1;
+    size_t need = strlen(dir) + 3;
+    char *pattern = malloc(need);
+    if (!pattern) { free(dir); return -1; }
+    snprintf(pattern, need, "%s/*", dir);
+    free(dir);
+
+    wchar_t *wpattern = win_widen(pattern);
+    free(pattern);
+    if (!wpattern) return -1;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
+    free(wpattern);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    int rc = 0;
+    do {
+        char *name = win_narrow(fd.cFileName);
+        if (!name) { rc = -1; break; }
+        if (name[0] == '.') { free(name); continue; } /* . .. and dotfiles */
+
+        size_t clen = strlen(rel) + 1 + strlen(name) + 1;
+        char *child = malloc(clen);
+        if (!child) { free(name); rc = -1; break; }
+        if (*rel) snprintf(child, clen, "%s/%s", rel, name);
+        else snprintf(child, clen, "%s", name);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            rc = walk(base, child, exts, out);
+        } else if (matches(name, exts)) {
+            if (buf_put(out, child, strlen(child)) < 0 || buf_put(out, "\n", 1) < 0) rc = -1;
+        }
+        free(child);
+        free(name);
+    } while (rc == 0 && FindNextFileW(h, &fd));
+
+    FindClose(h);
+    return rc;
+}
+
+#else
 
 static int walk(const char *base, const char *rel, const char *exts, Buf *out) {
     char *dir = at(base, rel);
@@ -113,6 +203,8 @@ static int walk(const char *base, const char *rel, const char *exts, Buf *out) {
     return 0;
 }
 
+#endif
+
 static int by_name(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
@@ -155,7 +247,7 @@ uint8_t *fsx_read(const char *root, const char *rel, size_t *len) {
     *len = 0;
     char *path = at(root, rel);
     if (!path) return NULL;
-    FILE *f = fopen(path, "rb");
+    FILE *f = FSX_FOPEN_R(path);
     free(path);
     if (!f) return NULL;
 
@@ -175,20 +267,39 @@ uint8_t *fsx_read(const char *root, const char *rel, size_t *len) {
 int fsx_stat(const char *root, const char *rel, double *size, double *mtime_ms) {
     char *path = at(root, rel);
     if (!path) return -1;
+
+#ifdef _WIN32
+    /* Second-resolution mtime, which is all _wstat64 offers and all the
+     * provider contract promises — mdy-docs compares mtimes for equality
+     * against a remembered one, never for sub-second ordering. */
+    wchar_t *w = win_widen(path);
+    free(path);
+    if (!w) return -1;
+    struct _stat64 st;
+    int rc = _wstat64(w, &st);
+    free(w);
+    if (rc != 0) return -1;
+    *size = (double)st.st_size;
+    *mtime_ms = (double)st.st_mtime * 1000.0;
+#else
     struct stat st;
     int rc = stat(path, &st);
     free(path);
     if (rc != 0) return -1;
     *size = (double)st.st_size;
-#if defined(__APPLE__)
+#  if defined(__APPLE__)
     *mtime_ms = (double)st.st_mtimespec.tv_sec * 1000.0 + st.st_mtimespec.tv_nsec / 1000000.0;
-#else
+#  else
     *mtime_ms = (double)st.st_mtim.tv_sec * 1000.0 + st.st_mtim.tv_nsec / 1000000.0;
+#  endif
 #endif
     return 0;
 }
 
 /** mkdir -p on a file's parent. */
+#ifdef _WIN32
+static int ensure_parent(char *path) { return win_ensure_parent(path); }
+#else
 static int ensure_parent(char *path) {
     char *cut = strrchr(path, '/');
     if (!cut || cut == path) return 0;
@@ -203,12 +314,13 @@ static int ensure_parent(char *path) {
     *cut = '/';
     return rc;
 }
+#endif
 
 int fsx_write(const char *root, const char *rel, const uint8_t *bytes, size_t len) {
     char *path = at(root, rel);
     if (!path) return -1;
     if (ensure_parent(path) != 0) { free(path); return -1; }
-    FILE *f = fopen(path, "wb");
+    FILE *f = FSX_FOPEN_W(path);
     free(path);
     if (!f) return -1;
     size_t wrote = len ? fwrite(bytes, 1, len, f) : 0;
@@ -218,12 +330,40 @@ int fsx_write(const char *root, const char *rel, const uint8_t *bytes, size_t le
 int fsx_remove(const char *root, const char *rel) {
     char *path = at(root, rel);
     if (!path) return -1;
+#ifdef _WIN32
+    wchar_t *w = win_widen(path);
+    free(path);
+    if (!w) return -1;
+    int rc = _wunlink(w);
+    free(w);
+#else
     int rc = unlink(path);
     free(path);
+#endif
     return (rc == 0 || errno == ENOENT) ? 0 : -1;
 }
 
+/*
+ * The working directory, `/`-separated even on Windows.
+ *
+ * Every path above this line is `/`-separated, because that is what the
+ * provider contract speaks and what mdy-docs' import graph does string maths
+ * on. Win32 accepts `/` in every path it is given, so the only place a
+ * backslash can enter the system is here — where the OS hands one back. It is
+ * translated once, at the boundary, rather than everywhere it would otherwise
+ * surface. See docs/desktop-plan.md, Phase 4, for why that matters: imports.js
+ * decides a module is inside its package by string prefix, and two spellings
+ * of one path are two packages.
+ */
 char *fsx_cwd(void) {
+#ifdef _WIN32
+    wchar_t wbuf[4096];
+    if (!_wgetcwd(wbuf, 4096)) return NULL;
+    char *utf8 = win_narrow(wbuf);
+    if (utf8) for (char *p = utf8; *p; p++) if (*p == '\\') *p = '/';
+    return utf8;
+#else
     char buf[4096];
     return getcwd(buf, sizeof buf) ? strdup(buf) : NULL;
+#endif
 }
