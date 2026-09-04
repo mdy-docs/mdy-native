@@ -9,7 +9,20 @@
 export const sep = '/';
 export const delimiter = ':';
 
-const clean = (p) => String(p).replace(/\\/g, '/');
+/*
+ * To `/`-separated, and with any leading slashes in front of a drive letter
+ * removed — `/D:/x` and `//D:/x` both become `D:/x`.
+ *
+ * That second rule is the whole of this shim's Windows handling, and it earns
+ * its place. mdy-docs says "this path is absolute" by passing it as
+ * `fs.read('/', absolutePath)` — see loadModule in
+ * ../../../../src/imports.js — and nodeFsProvider joins those two before
+ * reaching the filesystem. On Windows the absolute path starts `D:/`, so the
+ * join produces `/D:/…`, which names nothing. Node's own win32 join produces
+ * the same thing; this is not a case it was built for. It is the same rule
+ * fileURLToPath applies to `file:///C:/x`.
+ */
+const clean = (p) => String(p).replace(/\\/g, '/').replace(/^\/+(?=[A-Za-z]:\/)/, '');
 
 export function normalize(p) {
   const s = clean(p);

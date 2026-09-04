@@ -164,8 +164,20 @@ static int pump(JSRuntime *rt, JSContext *ctx) {
     if (fire_due_timers(ctx) > 0) return 1;
     double due = earliest_timer();
     if (due < 0) return 0;
+
+    /*
+     * A timer exists, so progress is guaranteed even if this particular wait
+     * does not reach its deadline — report it as progress and let the caller
+     * come round again.
+     *
+     * Returning 0 when nothing fired was wrong and Windows found it: its clock
+     * has ~15.6 ms granularity and Sleep can return early, so a 10 ms timer
+     * would wake with now_ms() still reading the same tick, fire nothing, and
+     * be reported as "promise never settled — nothing left to run".
+     */
     sleep_ms(due - now_ms());
-    return fire_due_timers(ctx) > 0 ? 1 : 0;
+    fire_due_timers(ctx);
+    return 1;
 }
 
 /* ---- waiting for JavaScript ---------------------------------------------- */
