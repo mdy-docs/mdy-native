@@ -231,6 +231,12 @@ whole subtrees, so an unknown falls back to `stat`.
 `ReadDirectoryChangesW` — three implementations, which is the plan's Phase 3
 and not a line to sneak in here. A build does not watch; `mdy dev` does.
 
+Everything else here is portable by accident of where the seams already were:
+lamassu and nisaba contain no platform `#ifdef`s at all, so [fsx.c](src/fsx.c)
+and [nis.c](src/nis.c) — 361 lines — are the entire surface that knows which
+operating system this is. Adding Windows means a second version of those two
+files and nothing else. See the plan's Phase 4.
+
 **Guest `import`** is `js_set_module_loader` in [src/lam.c](src/lam.c), routed
 out to mdy-docs' own loader (which reads through the provider and enforces the
 package boundary — see `canonicalizeModule` in ../../src/imports.js). Two
@@ -301,9 +307,15 @@ Adaptations worth knowing about, because each was a silent failure first:
 
 ## Next
 
-The backend builds. What it does not yet do is *serve* — Phase 2 and 3 of the
-plan are the editor and watching, and watching is where the missing `watch`
-method and a real change-notification path belong.
+The backend builds. What it does not yet do is *serve*, and the plan's Phase 1c
+is the next thing: one narrow protocol — `open` / `build` / `outputs` / the
+provider's nine / `watch` — specified once and implemented twice, over Tauri
+commands here and over a Worker on the web. That is what makes the editor and
+the preview one implementation for five targets instead of two applications
+that share a renderer.
+
+Watching (Phase 3) is where the missing `watch` method belongs, along with the
+three platform watchers it needs.
 
 `createIndex` used to be a no-op here and is now real —
 `dc_collection_add_index` with a B+tree of its own, backfilled from what is
