@@ -90,11 +90,43 @@ first conversion truncated every byte to a code unit, and it was an em dash
 coming back as `???` that gave it away. The corpus is Akkadian transliteration
 and cuneiform, so this had to be right before anything real crossed.
 
+## nisaba, natively
+
+```
+--- mdy-native: nisaba ---
+  insert corpus/en/uruk.mdy     : ok (rc=0, 78 bytes)
+  insert corpus/en/babylon.mdy  : ok (rc=0, 84 bytes)
+  find_one path=uruk     : found (78 bytes)
+  document carries title : Uruk
+```
+
+The query engine, answering the same filter shape `$.find({ path: … })`
+produces. Three things learned getting there.
+
+**All of nisaba's C compiles with `cc` and no changes** — including the files
+named `*_wasm.c`, whose `EMSCRIPTEN_KEEPALIVE` is a no-op off-target and which
+turned out to hold the regex entry points, not just exports. `db_wasm.c` is the
+one genuine exception: it is the WASM export layer, and a native host is what
+replaces it.
+
+**Its storage is not portable, and that is the seam working.** The shipped
+`bjio_host(fd)` reaches into `Module.bjioHandles` — a table of JS
+`FileSystemSyncAccessHandle` objects. That is the browser's storage bridged
+through emscripten and unreachable natively. But `bj_io` is four callbacks
+(`size`, `read`, `write`, `truncate`), so a native host writes its own; ours is
+a plain file descriptor. What the JS side calls `MemoryStorageProvider` becomes
+a temp file, which is not a compromise — the on-disk B+tree is nisaba's format.
+
+**`_id` must be minted by the host.** `dc_insert_one` refuses a document
+without one; the JS binding generates the ObjectId, so a native binding has to.
+That is the same rule met from the other side earlier: nisaba will not accept a
+scalar `_id`, and the primary tree's keys are fixed-width OID bytes.
+
 ## Next
 
 The remaining question. mdy-docs' natives return promises — a nested render, a
 query — and the WASM build leans on Asyncify to make that look synchronous to
-the guest. nisaba, bound the same way lamassu now is, and then mdy-docs' own bundle
+the guest. mdy-docs' own bundle
 loaded into QuickJS with `@mdy-docs/lamassu-js` and `@mdy-docs/nisaba-db`
 replaced by these bindings. At that point the corpus builds outside a browser
 and the ~2x estimate becomes a measurement.
