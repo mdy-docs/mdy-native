@@ -134,15 +134,29 @@ build/libnisaba.a: $(NIS_SRCS)
 	done
 	$(AR) rcs $@ build/nis/*.o
 
+# ---- the MDY front end, in C ----------------------------------------------
+#
+# github.com/mdy-docs/parse — the same parser mdy-docs has in JavaScript,
+# producing the same tree (87/87 documents of the reference corpus byte for
+# byte). It is here because the front end is where a native build's time goes:
+# a profile put every frame in the JavaScript layer, and this is the largest
+# single thing in it.
+PARSE     := third_party/parse
+PARSE_LIB := $(PARSE)/build/libmdyast.a
+PARSE_INC := -I$(PARSE)/include -I$(PARSE)/src
+
+$(PARSE_LIB):
+	$(MAKE) -C $(PARSE) build/libmdyast.a
+
 # ---- the backend ----------------------------------------------------------
 
-HOST_SRCS := src/host.c src/lam.c src/nis.c src/fsx.c src/oswin.c
+HOST_SRCS := src/host.c src/lam.c src/nis.c src/fsx.c src/oswin.c src/parse.c
 HOST_HDRS := src/lam.h src/nis.h src/fsx.h src/oswin.h
 
-build/mdy-native$(EXE): $(HOST_SRCS) $(HOST_HDRS) build/libquickjs.a build/libnisaba.a $(LAM_LIBS)
+build/mdy-native$(EXE): $(HOST_SRCS) $(HOST_HDRS) build/libquickjs.a build/libnisaba.a $(LAM_LIBS) $(PARSE_LIB)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(HOST_SRCS) \
-	  build/libnisaba.a $(LAM_LIBS) build/libquickjs.a -o $@ $(LDLIBS)
+	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(HOST_SRCS) \
+	  build/libnisaba.a $(LAM_LIBS) $(PARSE_LIB) build/libquickjs.a -o $@ $(LDLIBS)
 
 # build/mdy.js is the bundle: mdy-docs through esbuild with the two engine
 # imports aliased to shims/. See scripts-build.mjs.
@@ -224,7 +238,7 @@ check-golden: build/mdy-native$(EXE) build/site.js
 	done; \
 	exit $$fail
 
-.PHONY: build native site bench test clean
+.PHONY: build native site bench test test-c-parser clean
 # The 713 of mdy-docs' 776 tests that a runtime with no subprocesses, no HTTP
 # server and no WebAssembly can run. See tests-entry.mjs for what is left out
 # and why each one is a property of the runtime rather than a gap in the port.
@@ -232,6 +246,18 @@ test: build/mdy-native$(EXE) build/tests.js
 	@./build/mdy-native$(EXE) build/tests.js
 # `make build` rather than `make build/mdy-native`: the target's name carries
 # .exe on Windows, and a caller should not have to know that.
+# The same suite against the C front end, which is a SUBSET of what mdy-docs
+# documents — it renders the reference corpus byte-for-byte and does not yet
+# implement `#` comments, table captions or the `script` option. This prints
+# what is missing as a number so it can be watched going down; it is not a
+# gate, because the failures here are known and listed in README.md.
+test-c-parser: build/mdy-native$(EXE)
+	@MDY_PARSER=c node scripts-build.mjs tests
+	@./build/mdy-native$(EXE) build/tests.js > build/c-parser.log 2>&1 || true
+	@grep -c '^FAIL ' build/c-parser.log | sed 's/^/failing with the C front end: /'
+	@grep -o 'cannot honour `[a-zA-Z]*`' build/c-parser.log | sort | uniq -c | sort -rn | sed 's/^/  /'
+	@node scripts-build.mjs tests   # leave build/tests.js as `make test` expects it
+
 build: build/mdy-native$(EXE)
 
 native: build/mdy-native$(EXE) build/mdy.js

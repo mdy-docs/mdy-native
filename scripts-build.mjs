@@ -55,8 +55,52 @@ if (which === 'tests' && usesImportMeta.length > 0) {
   );
 }
 
+/*
+ * The MDY front end. src/parse/block.js exports one function, fromMdy, and
+ * this replaces it with the C parser — which is where a native build's time
+ * goes: a profile put every frame in the JavaScript layer, and this is the
+ * largest single thing in it. The 4,441 lines it displaces leave the bundle
+ * with it.
+ *
+ * A PLUGIN rather than an `alias` entry, because esbuild's alias maps package
+ * specifiers and this is a relative path: every importer writes it
+ * differently (`./block.js`, `./parse/block.js`, `../src/parse/block.js`), so
+ * the substitution has to happen after resolution rather than before.
+ *
+ * WHICH front end a bundle gets is a choice, because the C one is not yet a
+ * complete replacement. It renders the reference corpus byte-for-byte, and it
+ * does not implement everything mdy-docs documents — `#` comments, table
+ * captions and the `script` option among them. So:
+ *
+ *   - the application entries take it, which is the point of having it;
+ *   - the `tests` entry does NOT, so `make test` measures mdy-docs' own
+ *     behaviour rather than this parser's subset of it;
+ *   - `MDY_PARSER=c|js` overrides either way, and `make test-c-parser` uses it
+ *     to run the same suite against the C front end and print what is missing.
+ *
+ * The gap is a number that way, and a number can be watched going down. See
+ * shims/parse.js, which refuses an option it cannot honour rather than
+ * quietly ignoring it.
+ */
+const parserChoice = process.env.MDY_PARSER ?? (which === 'tests' ? 'js' : 'c');
+if (!['c', 'js'].includes(parserChoice)) {
+  throw new Error(`scripts-build: MDY_PARSER must be "c" or "js", not ${JSON.stringify(parserChoice)}`);
+}
+
+const blockJs = join(here, '..', '..', 'src', 'parse', 'block.js');
+const cFrontEnd = {
+  name: 'mdy-c-front-end',
+  setup(build) {
+    build.onResolve({ filter: /block\.js$/ }, (args) => {
+      const resolved = resolve(args.resolveDir, args.path);
+      return resolved === blockJs ? { path: join(here, 'shims', 'parse.js') } : undefined;
+    });
+  },
+};
+
 await esbuild.build({
   entryPoints: [join(here, entry)],
+  plugins: parserChoice === 'c' ? [cFrontEnd] : [],
   outfile: join(here, 'build', out),
   bundle: true,
   format: 'esm',
@@ -66,6 +110,7 @@ await esbuild.build({
   alias: {
     '@mdy-docs/lamassu-js': join(here, 'shims', 'lamassu.js'),
     '@mdy-docs/nisaba-db': join(here, 'shims', 'nisaba.js'),
+
 
     /*
      * node's builtins, for the `tests` entry — mdy-docs' own suite, run

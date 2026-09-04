@@ -31,6 +31,10 @@
 
 #include "quickjs.h"
 #include "fsx.h"
+
+/* The MDY front end in C — see src/parse.c. */
+JSValue mdy_native_parse(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+
 #include "lam.h"
 #include "nis.h"
 
@@ -641,6 +645,8 @@ int main(int argc, char **argv) {
     JS_SetPropertyStr(ctx, global, "__fs_stat", JS_NewCFunction(ctx, js_fs_stat, "__fs_stat", 2));
     JS_SetPropertyStr(ctx, global, "__fs_write", JS_NewCFunction(ctx, js_fs_write, "__fs_write", 3));
     JS_SetPropertyStr(ctx, global, "__fs_remove", JS_NewCFunction(ctx, js_fs_remove, "__fs_remove", 2));
+    JS_SetPropertyStr(ctx, global, "__mdy_parse",
+                      JS_NewCFunction(ctx, mdy_native_parse, "__mdy_parse", 3));
     JS_SetPropertyStr(ctx, global, "__fs_cwd", JS_NewCFunction(ctx, js_fs_cwd, "__fs_cwd", 0));
     JS_SetPropertyStr(ctx, global, "__fs_readdir", JS_NewCFunction(ctx, js_fs_readdir, "__fs_readdir", 1));
     JS_SetPropertyStr(ctx, global, "__fs_mkdir", JS_NewCFunction(ctx, js_fs_mkdir, "__fs_mkdir", 1));

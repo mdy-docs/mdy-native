@@ -472,6 +472,59 @@ Adaptations worth knowing about, because each was a silent failure first:
   Fixed in binjson itself — the count is a property of the data, so the only
   safe number of arguments is one.
 
+## The MDY front end, in C
+
+The parser is [github.com/mdy-docs/parse](https://github.com/mdy-docs/parse), a
+submodule at `third_party/parse`, and the application entries are bundled
+against it instead of `src/parse/block.js`. It is where a native build's time
+went: a profile put every frame in the JavaScript layer, and this was the
+largest single thing in it.
+
+```
+corpus, 93 pages          JS front end   C front end
+                              62.5 s        42.1 s
+bundle                        1.6 mb        1.1 mb
+```
+
+The comparison that matters is not the clock, though — it is that the output
+does not move. All 93 pages are **byte-identical** to what `node bin/mdy.js
+build` produces, and the parse repo's own harness holds 87/87 documents,
+284,872 nodes, 20,681 positions and 10,514 URL inputs against the JavaScript.
+
+### It is a subset, and the number is measured
+
+The C parser renders the corpus exactly and does **not** implement everything
+mdy-docs documents. Rather than let that be a surprise, `shims/parse.js`
+refuses an option it cannot honour — a thrown error naming the option, never a
+quiet difference in the output — and `make test-c-parser` runs mdy-docs' own
+suite against it and prints what is left:
+
+```
+$ make test-c-parser
+failing with the C front end: 181
+    87 cannot honour `script`
+    18 cannot honour `tasks`
+     6 cannot honour `arrows`
+     …
+```
+
+`script` is the largest by far and the least alarming: it is the `%` and `{{ }}`
+template layer, which runs *before* block parsing, so the site path never asks
+the C parser for it. `tasks`, `arrows` and the rest are inline options a
+document can turn on and the corpus does not.
+
+Which front end a bundle gets is a choice. The application entries take the C
+one; the `tests` entry does not, so `make test` measures **mdy-docs'**
+behaviour rather than this parser's subset of it, and stays at 684 passing.
+`MDY_PARSER=c|js` overrides either way.
+
+Four gaps have been closed this way already, each found by the suite and none
+by the corpus: `#` comments, the five raw-text elements (a layout's `<title>`
+was being wrapped in a `<p>`, which `make check-golden` caught), a fence's
+language being the first word of its info, and hast's attribute-name rules —
+which are case-insensitive for known names and verbatim for unknown ones, and
+where one name resolving differently reordered every property on an element.
+
 ## Next
 
 The backend builds. What it does not yet do is *serve*, and the plan's Phase 1c
