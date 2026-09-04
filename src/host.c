@@ -1,35 +1,23 @@
 /*
- * The QuickJS side, and the program. Includes quickjs.h and nothing from
- * lamassu — see lam.h for why they cannot meet in one file.
+ * mdy-native — the backend as a binary.
  *
- * THE ASYNC PROBLEM, which is the reason this file is interesting.
+ * mdy-docs' own JavaScript runs in QuickJS; lamassu and nisaba are linked as C
+ * rather than loaded as WebAssembly. No renderer, no webview, no memory
+ * ceiling. See ../../docs/desktop-plan.md for the measurements that chose
+ * this, and ../README.md for what it cost.
  *
- * A document calls `$.find(q)` synchronously — that is the language contract,
- * and every template depends on it. But mdy-docs implements those natives in
- * JavaScript and several are async: a query awaits the database, a nested
- * `$.render` awaits another render. The WASM build hides that with Asyncify:
- * the guest's call suspends mid-instruction while the JS host does its work.
+ * This file is the QuickJS half and includes nothing from either engine —
+ * lam.h and nis.h are the seams, and they name no type belonging to one. That
+ * separation was forced by a header collision (both engines use the `js_`
+ * prefix, and JS_TAG_STRING is a macro in one and an enum member in the
+ * other), and it is the right shape regardless.
  *
- * Natively there is no Asyncify, and the three ways out are not equal.
- * Rewriting mdy-docs' natives to be synchronous would diverge from the Node
- * path for the whole life of the project. Making the guest `await` would break
- * the contract that `$.find(q)` returns documents rather than a promise. So
- * this takes the third: the native calls into QuickJS, and if the answer is a
- * promise it PUMPS QUICKJS'S JOB QUEUE until that promise settles, then hands
- * the value back synchronously. The guest never learns it waited, and
- * mdy-docs' JavaScript is untouched.
- *
- * The re-entrancy that looks alarming turns out to be fine, and is checked
- * below. A nested `$.render` means: lamassu native -> QuickJS -> mdy-docs ->
- * lamassu again. The inner call gets its OWN JsVm, exactly as src/vm.js gives
- * each nesting level its own pooled instance, so nothing re-enters a suspended
- * VM.
- *
- * What this cannot do is wait for something only an outer event loop would
- * deliver — a socket, a timer. Pumping finds no job, the promise stays
- * pending, and rather than hang, that is reported as the deadlock it is. In a
- * native backend the filesystem is synchronous C, so the case should not
- * arise; if it ever does, it will say so instead of stopping.
+ * THE ASYNC CONTRACT. A document calls `$.find(q)` synchronously; mdy-docs
+ * implements that native in JavaScript and it is async. There is no Asyncify
+ * natively, so when a host call returns a promise this pumps QuickJS's job
+ * queue until it settles and returns the value synchronously. The guest never
+ * learns it waited, mdy-docs is untouched, and a promise that cannot settle is
+ * reported rather than hung on.
  */
 #include <stdbool.h>
 #include <stdio.h>
@@ -38,16 +26,12 @@
 
 #include "quickjs.h"
 #include "lam.h"
+#include "nis.h"
 
-typedef struct {
-    JSContext *ctx;
-    JSValue handler;
-} Host;
+static JSContext *g_ctx;
 
-/*
- * A JS result to a string, waiting for it first if it is a promise.
- * Returns NULL only if the promise cannot be settled by running jobs.
- */
+/* ---- waiting for JavaScript ---------------------------------------------- */
+
 static char *settle_to_string(JSContext *ctx, JSValue value, const char **why) {
     *why = NULL;
     JSRuntime *rt = JS_GetRuntime(ctx);
@@ -56,12 +40,7 @@ static char *settle_to_string(JSContext *ctx, JSValue value, const char **why) {
         JSContext *which = NULL;
         int ran = JS_ExecutePendingJob(rt, &which);
         if (ran < 0) { *why = "a queued job threw"; return NULL; }
-        if (ran == 0) {
-            /* Nothing left to run and still pending: this is waiting on
-             * something the host cannot deliver by running jobs. Say so. */
-            *why = "promise never settled — nothing left to run";
-            return NULL;
-        }
+        if (ran == 0) { *why = "promise never settled — nothing left to run"; return NULL; }
     }
 
     JSValue settled = value;
@@ -72,7 +51,6 @@ static char *settle_to_string(JSContext *ctx, JSValue value, const char **why) {
         owned = true;
         if (state == JS_PROMISE_REJECTED) *why = "the host rejected";
     }
-
     const char *s = JS_ToCString(ctx, settled);
     char *out = s ? strdup(s) : NULL;
     if (s) JS_FreeCString(ctx, s);
@@ -80,88 +58,206 @@ static char *settle_to_string(JSContext *ctx, JSValue value, const char **why) {
     return out;
 }
 
-/* lamassu asked; answer it in JavaScript, waiting if the answer is a promise. */
-static char *ask_quickjs(const char *question, void *ud) {
-    Host *h = ud;
-    JSValue arg = JS_NewString(h->ctx, question);
-    JSValue answer = JS_Call(h->ctx, h->handler, JS_UNDEFINED, 1, &arg);
-    JS_FreeValue(h->ctx, arg);
+/* A `__hostcall(name, argsJson)` from inside the sandbox, answered in JS. */
+static char *dispatch(const char *name, const char *args_json, void *ud) {
+    long id = (long)ud;
+    JSValue global = JS_GetGlobalObject(g_ctx);
+    JSValue fn = JS_GetPropertyStr(g_ctx, global, "__lam_dispatch");
+    JS_FreeValue(g_ctx, global);
+
+    JSValue argv[3] = { JS_NewInt32(g_ctx, (int)id), JS_NewString(g_ctx, name),
+                        JS_NewString(g_ctx, args_json) };
+    JSValue answer = JS_Call(g_ctx, fn, JS_UNDEFINED, 3, argv);
+    for (int i = 0; i < 3; i++) JS_FreeValue(g_ctx, argv[i]);
+    JS_FreeValue(g_ctx, fn);
+
     if (JS_IsException(answer)) {
-        JS_FreeValue(h->ctx, answer);
-        return strdup("(host threw)");
+        JSValue e = JS_GetException(g_ctx);
+        const char *m = JS_ToCString(g_ctx, e);
+        fprintf(stderr, "mdy-native: host call %s threw: %s\n", name, m ? m : "?");
+        if (m) JS_FreeCString(g_ctx, m);
+        JS_FreeValue(g_ctx, e);
+        JS_FreeValue(g_ctx, answer);
+        return strdup("null");
     }
     const char *why = NULL;
-    char *out = settle_to_string(h->ctx, answer, &why);
-    JS_FreeValue(h->ctx, answer);
-    if (!out) { char buf[160]; snprintf(buf, sizeof buf, "(%s)", why ? why : "no answer"); return strdup(buf); }
-    if (why) { char buf[256]; snprintf(buf, sizeof buf, "(%s: %s)", why, out); free(out); return strdup(buf); }
+    char *out = settle_to_string(g_ctx, answer, &why);
+    JS_FreeValue(g_ctx, answer);
+    if (!out || why) {
+        fprintf(stderr, "mdy-native: host call %s: %s\n", name, why ? why : "no answer");
+        free(out);
+        return strdup("null");
+    }
     return out;
 }
 
-/*
- * A native the HOST's JavaScript can call to run another lamassu program.
- * This stands in for a nested `$.render`, and exists to prove the re-entrant
- * path: sandbox -> host -> sandbox, with the inner run on its own VM.
- */
-static JSValue js_run_sandbox(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+/* ---- the natives the shims call ------------------------------------------ */
+
+static JSValue js_lam_eval(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
-    if (argc < 1) return JS_UNDEFINED;
-    const char *src = JS_ToCString(ctx, argv[0]);
-    if (!src) return JS_UNDEFINED;
+    if (argc < 2) return JS_UNDEFINED;
+    int32_t id = 0;
+    JS_ToInt32(ctx, &id, argv[0]);
+    const char *program = JS_ToCString(ctx, argv[1]);
+    if (!program) return JS_UNDEFINED;
+
     char *err = NULL;
-    char *out = lam_eval(src, NULL, NULL, &err);
-    JSValue r = JS_NewString(ctx, err ? err : (out ? out : ""));
-    free(out); free(err); JS_FreeCString(ctx, src);
+    char *out = lam_eval(program, dispatch, (void *)(long)id, &err);
+    JS_FreeCString(ctx, program);
+
+    if (err) { JSValue e = JS_ThrowInternalError(ctx, "%s", err); free(err); free(out); return e; }
+    JSValue r = JS_NewString(ctx, out ? out : "");
+    free(out);
     return r;
 }
 
-int main(void) {
+static JSValue js_nis_open(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    return JS_NewInt32(ctx, nis_open());
+}
+
+static JSValue js_nis_insert(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_NewInt32(ctx, -1);
+    int32_t handle = 0;
+    JS_ToInt32(ctx, &handle, argv[0]);
+    size_t len = 0;
+    uint8_t *bytes = JS_GetArrayBuffer(ctx, &len, argv[1]);
+    if (!bytes) return JS_NewInt32(ctx, -1);
+    return JS_NewInt32(ctx, nis_insert(handle, bytes, (uint32_t)len));
+}
+
+static JSValue js_nis_find(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_NULL;
+    int32_t handle = 0;
+    JS_ToInt32(ctx, &handle, argv[0]);
+    size_t flen = 0;
+    uint8_t *filter = JS_GetArrayBuffer(ctx, &flen, argv[1]);
+    if (!filter) return JS_NULL;
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    if (nis_find(handle, filter, (uint32_t)flen, &out, &out_len) < 0 || !out) return JS_NULL;
+    JSValue buf = JS_NewArrayBufferCopy(ctx, out, out_len);
+    free(out);
+    return buf;
+}
+
+/* Neither `print` nor `console` is part of QuickJS the library — they come
+ * from quickjs-libc, which a host that supplies its own natives does not link.
+ * mdy-docs writes to console in a few places, so both exist and both go to
+ * stdout. */
+static JSValue js_print(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    for (int i = 0; i < argc; i++) {
+        const char *s = JS_ToCString(ctx, argv[i]);
+        printf("%s%s", i ? " " : "", s ? s : "");
+        if (s) JS_FreeCString(ctx, s);
+    }
+    printf("\n");
+    fflush(stdout);
+    return JS_UNDEFINED;
+}
+
+/* ---- the program --------------------------------------------------------- */
+
+static char *read_file(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)n + 1);
+    *len = fread(buf, 1, (size_t)n, f);
+    buf[*len] = '\0';
+    fclose(f);
+    return buf;
+}
+
+int main(int argc, char **argv) {
+    const char *bundle_path = argc > 1 ? argv[1] : "build/mdy.js";
+
     JSRuntime *rt = JS_NewRuntime();
     JSContext *ctx = JS_NewContext(rt);
+    g_ctx = ctx;
 
     JSValue global = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, global, "runSandbox",
-                      JS_NewCFunction(ctx, js_run_sandbox, "runSandbox", 1));
+    JS_SetPropertyStr(ctx, global, "__lam_eval", JS_NewCFunction(ctx, js_lam_eval, "__lam_eval", 2));
+    JS_SetPropertyStr(ctx, global, "__nis_open", JS_NewCFunction(ctx, js_nis_open, "__nis_open", 0));
+    JS_SetPropertyStr(ctx, global, "__nis_insert", JS_NewCFunction(ctx, js_nis_insert, "__nis_insert", 2));
+    JS_SetPropertyStr(ctx, global, "__nis_find", JS_NewCFunction(ctx, js_nis_find, "__nis_find", 2));
 
-    /*
-     * The host half, in ordinary JavaScript — a stand-in for mdy-docs' `$`
-     * natives. One synchronous, one async, and one async that re-enters the
-     * sandbox the way a nested $.render does.
-     */
-    static const char *HOST_JS =
-        "const sleep = (ms) => new Promise((r) => Promise.resolve().then(r));\n"
-        "globalThis.answer = async (q) => {\n"
-        "  if (q === 'sync') return 'answered synchronously';\n"
-        "  if (q === 'unicode') return 'Ašared — Uruk’s scribes, ‰, 𒀭';\n"
-        "  if (q === 'async') { await sleep(0); await sleep(0); return 'answered after awaiting'; }\n"
-        "  if (q === 'nested') { await sleep(0); return 'inner sandbox said: ' + runSandbox(\"'42 * 2 = ' + (42 * 2)\"); }\n"
-        "  if (q === 'stuck') return new Promise(() => {});\n"
-        "  return 'no answer for: ' + q;\n"
-        "};\n";
-    JSValue r = JS_Eval(ctx, HOST_JS, strlen(HOST_JS), "<host>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) { fprintf(stderr, "host js failed\n"); return 1; }
-    JS_FreeValue(ctx, r);
-
-    Host host = { .ctx = ctx, .handler = JS_GetPropertyStr(ctx, global, "answer") };
+    JSValue print_fn = JS_NewCFunction(ctx, js_print, "print", 1);
+    JS_SetPropertyStr(ctx, global, "print", JS_DupValue(ctx, print_fn));
+    JSValue console = JS_NewObject(ctx);
+    for (const char *const *m = (const char *const[]){ "log", "warn", "error", "info", "debug", NULL }; *m; m++)
+        JS_SetPropertyStr(ctx, console, *m, JS_DupValue(ctx, print_fn));
+    JS_SetPropertyStr(ctx, global, "console", console);
+    JS_FreeValue(ctx, print_fn);
     JS_FreeValue(ctx, global);
 
-    printf("--- mdy-native: async host calls ---\n");
-    struct { const char *label, *program; } cases[] = {
-        { "sync native      ", "'-> ' + ask('sync')" },
-        { "async native     ", "'-> ' + ask('async')" },
-        { "re-entrant render", "'-> ' + ask('nested')" },
-        { "never settles    ", "'-> ' + ask('stuck')" },
-        { "unicode round trip", "'-> ' + ask('unicode')" },
-    };
-    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
-        char *err = NULL;
-        char *out = lam_eval(cases[i].program, ask_quickjs, &host, &err);
-        printf("  %s: %s\n", cases[i].label, err ? err : out);
-        free(out); free(err);
+    size_t len = 0;
+    char *bundle = read_file(bundle_path, &len);
+    if (!bundle) { fprintf(stderr, "mdy-native: cannot read %s\n", bundle_path); return 1; }
+
+    JSValue r = JS_Eval(ctx, bundle, len, bundle_path, JS_EVAL_TYPE_MODULE);
+    free(bundle);
+    if (JS_IsException(r)) {
+        JSValue e = JS_GetException(ctx);
+        const char *m = JS_ToCString(ctx, e);
+        fprintf(stderr, "mdy-native: %s\n", m ? m : "bundle failed");
+        if (m) JS_FreeCString(ctx, m);
+        JS_FreeValue(ctx, e);
+        return 1;
+    }
+    /*
+     * A module evaluates to a promise, and a top-level await leaves work
+     * queued behind it. Drain, then LOOK AT IT: an unhandled module rejection
+     * is otherwise a silent exit 0, which is the least useful failure a host
+     * can have.
+     */
+    for (;;) {
+        JSContext *which = NULL;
+        int ran = JS_ExecutePendingJob(rt, &which);
+        if (ran < 0) {
+            JSValue e = JS_GetException(ctx);
+            const char *m = JS_ToCString(ctx, e);
+            fprintf(stderr, "mdy-native: %s\n", m ? m : "a job threw");
+            if (m) JS_FreeCString(ctx, m);
+            JS_FreeValue(ctx, e);
+            JS_FreeValue(ctx, r);
+            return 1;
+        }
+        if (ran == 0) break;
+    }
+    int status = 0;
+    if (JS_IsObject(r) && JS_PromiseState(ctx, r) == JS_PROMISE_REJECTED) {
+        JSValue reason = JS_PromiseResult(ctx, r);
+        const char *m = JS_ToCString(ctx, reason);
+        JSValue stack = JS_GetPropertyStr(ctx, reason, "stack");
+        const char *st = JS_ToCString(ctx, stack);
+        fprintf(stderr, "mdy-native: %s\n%s", m ? m : "the bundle rejected", st ? st : "");
+        if (m) JS_FreeCString(ctx, m);
+        if (st) JS_FreeCString(ctx, st);
+        JS_FreeValue(ctx, stack);
+        JS_FreeValue(ctx, reason);
+        status = 1;
+    } else if (JS_IsObject(r) && JS_PromiseState(ctx, r) == JS_PROMISE_PENDING) {
+        fprintf(stderr, "mdy-native: the bundle never finished — nothing left to run\n");
+        status = 1;
+    }
+    JS_FreeValue(ctx, r);
+
+    /* The bundle's own verdict, if it has one. */
+    if (status == 0) {
+        JSValue g = JS_GetGlobalObject(ctx);
+        JSValue v = JS_GetPropertyStr(ctx, g, "__exit_status");
+        int32_t code = 0;
+        if (!JS_IsUndefined(v) && JS_ToInt32(ctx, &code, v) == 0) status = code;
+        JS_FreeValue(ctx, v);
+        JS_FreeValue(ctx, g);
     }
 
-    JS_FreeValue(ctx, host.handler);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
-    return 0;
+    return status;
 }

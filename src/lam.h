@@ -21,11 +21,12 @@
  * terms: a question in, an answer out, both UTF-8, the answer owned by the
  * caller. This is what every `$` native becomes — find, render, emit — once
  * the host side is mdy-docs' own JavaScript. */
-typedef char *(*lam_ask_fn)(const char *question, void *ud);
+typedef char *(*lam_ask_fn)(const char *name, const char *args_json, void *ud);
 
-/* Evaluate one lamassu program with `ask` available to it.
- * Returns the completion value as UTF-8 (caller frees), or NULL with *err set
- * (caller frees). */
+/* Evaluate one lamassu program with `__hostcall(name, argsJson)` available to
+ * it — the same contract buildProgram already generates, so mdy-docs' own
+ * programs run unchanged. Returns the completion value as UTF-8 (caller
+ * frees), or NULL with *err set (caller frees). */
 char *lam_eval(const char *source, lam_ask_fn ask, void *ud, char **err);
 
 #endif

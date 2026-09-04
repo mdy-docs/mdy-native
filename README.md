@@ -6,12 +6,60 @@ memory ceiling. See [docs/desktop-plan.md](../../docs/desktop-plan.md) —
 "The backend is not a webview" — for the measurements that chose this.
 
 ```sh
-make run
+make native   # build both halves and run the checked render
+make bench    # the same 200-document set, native and over WASM in node
 ```
 
 ## What is here right now
 
-The bridge, and only the bridge:
+**mdy-docs renders, unmodified, on this backend.** `make native` bundles the
+package with the two engine imports aliased to [shims/](shims/) and runs
+`renderDocumentSet` inside the host:
+
+```
+--- mdy-native: mdy-docs on QuickJS, engines linked as C ---
+  ok    the title, from the document's own front matter
+  ok    both cities, found by query
+  ok    …in the order they were written
+  ok    each one through a nested render
+```
+
+Exit status is the verdict, so this is a test rather than a demo. The four
+checks are chosen to cross every boundary the claim rests on: a `$.find` goes
+guest → host → nisaba and back with a filter; a `$.render` recurses onto a
+second lamassu VM while the first is suspended mid-host-call; and the strings
+carry an em dash and a cuneiform sign, so the UTF-8/UTF-16 round trip through
+both engines is checked rather than assumed.
+
+Nothing in mdy-docs knows any of this. [entry.mjs](entry.mjs) imports
+`renderDocumentSet` from the package the same way a node build does; the only
+substitution is two esbuild aliases in [scripts-build.mjs](scripts-build.mjs),
+and the shims behind them are 130 lines together.
+
+### What it cost, measured
+
+The same 200-document set — one `$.find` over all of them, each rendered
+through a nested render — both ways, on the same machine:
+
+|                    | wall  | peak RSS | runtime on disk |
+| ------------------ | ----- | -------- | --------------- |
+| node + WASM engines| 300ms | 138 MB   | ~110 MB (node)  |
+| this               | 314ms | 21 MB    | 1.8 MB stripped |
+
+**Time is a wash; memory is 6.6× smaller.** That is a better result than the
+earlier estimate, and the reason is worth stating because it is not obvious.
+QuickJS has no JIT and runs mdy-docs' own JavaScript several times slower than
+V8 — the ingest phase, measured alone on the corpus, was 17.2s against 2.2s.
+But a build of a real document set does not spend its time there: it spends it
+inside lamassu, running templates. Natively that is C rather than WebAssembly,
+and what it gains back is roughly what QuickJS gives up. The two effects very
+nearly cancel.
+
+The memory number does not cancel, and memory is what this was for. A webview
+build died at page 45 of the corpus against a 1146 MB ceiling; 21 MB against
+138 MB is the same work in a seventh of the space, with no ceiling above it.
+
+### The bridge underneath
 
 ```
 --- mdy-native bridge ---
@@ -75,10 +123,15 @@ learns it waited, and mdy-docs' JavaScript is untouched.
 
 Four of those matter.
 
-**Re-entrancy is fine.** A nested `$.render` means sandbox → host → sandbox.
-The inner run gets its own `JsVm`, exactly as [../../src/vm.js](../../src/vm.js)
-gives each nesting level its own pooled instance, so nothing re-enters a
-suspended VM.
+**Re-entrancy is fine, but it has to be stacked.** A nested `$.render` means
+sandbox → host → sandbox. The inner run gets its own `JsVm`, exactly as
+[../../src/vm.js](../../src/vm.js) gives each nesting level its own pooled
+instance, so nothing re-enters a suspended VM. What was NOT fine at first is
+subtler: lamassu passes a native no user pointer of its own, so "which VM is
+asking" lives in a global, and an inner `lam_eval` was overwriting the outer's.
+The symptom was a *second* nested render failing with `unknown native
+"render"` — the outer eval resumed holding the inner's identity, whose natives
+the VM pool had already torn down. `lam_eval` now saves and restores it.
 
 **A promise that cannot settle says so.** Pumping finds no job, and rather than
 hang, the deadlock is reported. In a native backend the filesystem is
@@ -122,11 +175,43 @@ without one; the JS binding generates the ObjectId, so a native binding has to.
 That is the same rule met from the other side earlier: nisaba will not accept a
 scalar `_id`, and the primary tree's keys are fixed-width OID bytes.
 
+## The shims
+
+Two files, and both are short because mdy-docs asks the engines for very
+little. [shims/lamassu.js](shims/lamassu.js) is `createLamassu()` with
+`eval` / `setNatives` / `setModuleLoader` / `reset`, and it keeps the
+`__hostcall(name, argsJson)` contract exactly as `buildProgram` generates it —
+values could have crossed as values natively, but keeping the JSON means the
+generated program is byte-identical on both backends, and one fewer thing
+differs while both exist. [shims/nisaba.js](shims/nisaba.js) is `connect`, a
+collection, `insertOne`, `find().toArray()` and `createIndex`, with documents
+crossing as binjson encoded by the reference JS codec from nisaba's own
+submodule.
+
+Two adaptations worth knowing about, because both were silent failures first:
+
+- **`lam_eval` answers with the completion value; `lamassu_eval` answers with a
+  transcript** whose completion value is the line after `⇒ `. The latter is the
+  WASM export layer, which a native host does not have, and it is the shape
+  `src/vm.js` reads. The shim puts the marker back rather than teaching vm.js
+  which backend it is talking to.
+- **The `_id` has to be the codec's own `ObjectId`.** A hand-rolled
+  `{ $oid: bytes }` encodes to something `dc_insert_one` rejects — and it
+  rejects it by returning `-1`, which the shim was ignoring, so inserts
+  "succeeded" and every query came back empty. The class also gives the 24-hex
+  `toString` that `src/mdy.js` keys its index map by, so an inserted document
+  and a found one agree without either side knowing about the other.
+
 ## Next
 
-The remaining question. mdy-docs' natives return promises — a nested render, a
-query — and the WASM build leans on Asyncify to make that look synchronous to
-the guest. mdy-docs' own bundle
-loaded into QuickJS with `@mdy-docs/lamassu-js` and `@mdy-docs/nisaba-db`
-replaced by these bindings. At that point the corpus builds outside a browser
-and the ~2x estimate becomes a measurement.
+Two gaps stand between this and building the corpus natively: a filesystem
+provider (the nine methods in [../../src/fs-provider.js](../../src/fs-provider.js),
+over QuickJS's `std`/`os` modules) and a module loader for guest `import()`.
+Neither is structural — the hard parts, async host calls and the two engines in
+one process, are done.
+
+Two smaller honesties, both marked in the code. `createIndex` is a no-op: the
+sparse `path` index is an optimisation and a query without it is a scan, so the
+answers are the same and only the timing differs. And `setModuleLoader` does
+nothing, so a document that reaches for guest-side `import()` will fail rather
+than quietly render without it.

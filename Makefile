@@ -71,3 +71,30 @@ build/nis_probe: src/nis_probe.c build/libnisaba.a
 .PHONY: nisaba
 nisaba: build/nis_probe
 	@./build/nis_probe
+
+# ---- the backend ----------------------------------------------------------
+#
+# Everything at once: mdy-docs' own JavaScript in QuickJS, both engines linked
+# as C beneath it. build/mdy.js is the bundle (`node scripts-build.mjs`), with
+# the two engine packages aliased to shims/ that call the natives below.
+build/mdy-native: src/host.c src/lam.c src/nis.c src/lam.h src/nis.h build/lamassu.o build/libnisaba.a
+	@mkdir -p build
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -Isrc $(NIS_INC) \
+	  src/host.c src/lam.c src/nis.c build/lamassu.o build/libnisaba.a -o $@ \
+	  $(QUICKJS)lib/quickjs/libquickjs.a -lm -lpthread
+
+build/mdy.js: entry.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js
+	node scripts-build.mjs
+
+build/bench.js: bench-entry.mjs bench-body.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js
+	node scripts-build.mjs bench
+
+.PHONY: native bench
+native: build/mdy-native build/mdy.js
+	@./build/mdy-native build/mdy.js
+
+# The same 200-document set both ways. `node` is mdy-docs over the WASM
+# engines; `native` is this. See README.md for what the numbers said.
+bench: build/mdy-native build/bench.js
+	@/usr/bin/time -l ./build/mdy-native build/bench.js 2>&1 | grep -E "native:|maximum resident"
+	@/usr/bin/time -l node bench-node.mjs 2>&1 | grep -E "node:|maximum resident"

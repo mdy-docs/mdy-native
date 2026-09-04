@@ -88,10 +88,18 @@ static bool native_ask(JsContext *ctx, JsValue this_val, const JsValue *args, in
     size_t len = 0;
     const uint16_t *units = js_string_units(args[0], &len);
     if (!units) return true;
+    char *name = from_utf16(units, len);
 
-    char *question = from_utf16(units, len);
-    char *answer = g_ask(question, g_ask_ud);
-    free(question);
+    char *args_json = NULL;
+    if (argc > 1) {
+        size_t alen = 0;
+        const uint16_t *aunits = js_string_units(args[1], &alen);
+        if (aunits) args_json = from_utf16(aunits, alen);
+    }
+
+    char *answer = g_ask(name, args_json ? args_json : "[]", g_ask_ud);
+    free(name);
+    free(args_json);
     if (!answer) return true;
 
     size_t alen = 0;
@@ -104,15 +112,29 @@ static bool native_ask(JsContext *ctx, JsValue this_val, const JsValue *args, in
 
 char *lam_eval(const char *source, lam_ask_fn ask, void *ud, char **err) {
     *err = NULL;
+
+    /*
+     * SAVE AND RESTORE, because this is re-entrant: `$.render` is a host call
+     * whose answer comes from another lam_eval, so an inner call runs while an
+     * outer one is suspended inside native_ask. lamassu hands a native no user
+     * pointer of its own (the slot js_register_native takes is not passed back
+     * to the callback), so the "who is asking" state is global — which is fine
+     * as long as it is stacked. It was not, once, and the symptom was a second
+     * nested render failing with `unknown native "render"`: the outer eval
+     * resumed holding the inner's identity, and the inner's natives had already
+     * been torn down by the pool.
+     */
+    lam_ask_fn saved_ask = g_ask;
+    void *saved_ud = g_ask_ud;
     g_ask = ask;
     g_ask_ud = ud;
 
     JsVm *vm = js_vm_new(NULL);
-    if (!vm) { *err = strdup("lamassu: no vm"); return NULL; }
+    if (!vm) { *err = strdup("lamassu: no vm"); g_ask = saved_ask; g_ask_ud = saved_ud; return NULL; }
     JsContext *ctx = js_context_new(vm);
 
     size_t nlen = 0;
-    uint16_t *name = to_utf16("ask", &nlen);
+    uint16_t *name = to_utf16("__hostcall", &nlen);
     js_register_native(ctx, name, nlen, native_ask, NULL);
     free(name);
 
@@ -127,6 +149,8 @@ char *lam_eval(const char *source, lam_ask_fn ask, void *ud, char **err) {
         snprintf(buf, sizeof buf, "lamassu compile: %s (at %u)", msg, pos);
         *err = strdup(buf);
         js_vm_free(vm);
+        g_ask = saved_ask;
+        g_ask_ud = saved_ud;
         return NULL;
     }
 
@@ -136,5 +160,7 @@ char *lam_eval(const char *source, lam_ask_fn ask, void *ud, char **err) {
     const uint16_t *units = js_string_units(value, &len);
     char *out = units ? from_utf16(units, len) : strdup("(no string completion value)");
     js_vm_free(vm);
+    g_ask = saved_ask;
+    g_ask_ud = saved_ud;
     return out;
 }
