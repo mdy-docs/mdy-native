@@ -1938,8 +1938,9 @@ static bool emit_native(JsContext *ctx, JsValue this_val, const JsValue *args,
 
 /* ---- opening a set ---------------------------------------------------------- */
 
-/* nisaba keys its primary tree on OID bytes and needs a file behind it; a set
- * built from a source is in memory, so this is a temporary the OS reclaims. */
+/* nisaba keys its primary tree on OID bytes. Its storage is four callbacks
+ * (see nis.c), and here they are a buffer: a document set lives as long as the
+ * engine that opened it and never wanted a file. */
 extern int nis_open(void);
 extern int nis_insert(int handle, const uint8_t *doc, uint32_t len);
 extern int nis_find(int handle, const uint8_t *filter, uint32_t filter_len,
@@ -1992,16 +1993,39 @@ int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
      * answered from an index comes back in INDEX order, not `_id` order.
      */
     {
+        /*
+         * `fields` is a binjson ARRAY OF STRINGS — the fields in composite-key
+         * order — not the `{ path: 1 }` object MongoDB's createIndex takes.
+         * It was written as that object, which decodes as an unknown type, so
+         * the call returned BJ_ERR_UNKNOWN_TYPE and the index was never
+         * registered. Nothing said so, because the return value was dropped:
+         * every `$.render({ path: … })` then scanned the whole collection, and
+         * on a 93-page site that was 62% of the entire build.
+         *
+         * So the result is CHECKED. An index that silently fails to exist is
+         * indistinguishable from one that works, right up until a corpus is
+         * large enough to notice.
+         */
         bj_builder *spec = bj_builder_new();
-        if (spec) {
-            bj_begin_object(spec);
-            bj_put_key(spec, (const uint8_t *)"path", 4);
-            bj_put_int(spec, 1);
-            bj_end_object(spec);
-            size_t slen = 0;
-            const uint8_t *bytes = bj_builder_data(spec, &slen);
-            nis_create_index(e->handle, "path", bytes, (uint32_t)slen, 0, 1);
-            bj_builder_free(spec);
+        if (!spec) {
+            if (error && error_len) snprintf(error, error_len, "out of memory");
+            close_set(e);
+            return -1;
+        }
+        bj_begin_array(spec);
+        bj_put_string(spec, (const uint8_t *)"path", 4);
+        bj_end_array(spec);
+        size_t slen = 0;
+        const uint8_t *bytes = bj_builder_data(spec, &slen);
+        int rc = bj_builder_error(spec) ? -1
+               : nis_create_index(e->handle, "path", bytes, (uint32_t)slen, 0, 1);
+        bj_builder_free(spec);
+        if (rc != 0) {
+            if (error && error_len)
+                snprintf(error, error_len,
+                         "could not index documents by path (nisaba error %d)", rc);
+            close_set(e);
+            return -1;
         }
     }
 

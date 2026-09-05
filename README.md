@@ -240,8 +240,16 @@ replaces it.
 `FileSystemSyncAccessHandle` objects. That is the browser's storage bridged
 through emscripten and unreachable natively. But `bj_io` is four callbacks
 (`size`, `read`, `write`, `truncate`), so a native host writes its own; ours is
-a plain file descriptor. What the JS side calls `MemoryStorageProvider` becomes
-a temp file, which is not a compromise — the on-disk B+tree is nisaba's format.
+a growable buffer. What the JS side calls `MemoryStorageProvider` is a memory
+store here too — it was a temp file, described in a comment as having "the
+lifetime MemoryStorageProvider promises", which is a memory store with a detour
+through the kernel. A persistent store is still four callbacks away.
+
+**Index specs are a binjson ARRAY OF STRINGS**, not MongoDB's `{ field: 1 }`
+object. Writing the object gets `BJ_ERR_UNKNOWN_TYPE` back, and if the return
+value is dropped the index simply does not exist — which is indistinguishable
+from one that works until a corpus is large enough for the full scans to show.
+Ours was missing for exactly that reason, and it was 62% of a 93-page build.
 
 **`_id` must be minted by the host.** `dc_insert_one` refuses a document
 without one; the JS binding generates the ObjectId, so a native binding has to.
