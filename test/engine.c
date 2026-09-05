@@ -102,6 +102,73 @@ int main(void) {
         mdy_engine_free(e);
     }
 
+    printf("--- engine: transform, the tree through lamassu and back ---\n");
+
+    /*
+     * The one place a document's own code sees its tree. The host parses the
+     * lines, hands the tree to the guest as VALUES, the guest changes it, and
+     * the host takes it back — no JSON in either direction.
+     */
+    check("a transform sees the tree and can change it",
+          "%% transform((tree) => {\n"
+          "  visit(tree, 'h1', (node) => { node.tagName = 'h2'; });\n"
+          "})\n"
+          "= Title",
+          "<h2 id=\"title\">Title</h2>");
+
+    check("…and can set a property",
+          "%% transform((tree) => {\n"
+          "  visit(tree, 'p', (node) => { node.properties.className = ['lead']; });\n"
+          "})\n"
+          "text",
+          "<p class=\"lead\">text</p>");
+
+    check("…and can read the text through the toolkit",
+          "%% transform((tree) => {\n"
+          "  visit(tree, 'h1', (node) => { node.properties.id = slug(toText(node)); });\n"
+          "})\n"
+          "= A Long Title",
+          "<h1 id=\"a-long-title\">A Long Title</h1>");
+
+    check("…and can return a new tree",
+          "%% transform(() => ({ type: 'element', tagName: 'main', properties: {},\n"
+          "  children: [{ type: 'text', value: 'replaced' }] }))\n"
+          "= Gone",
+          "<main>replaced</main>");
+
+    check("…and can add a node with h()",
+          "%% transform((tree) => {\n"
+          "  tree.children.push(h('footer.note', 'end'));\n"
+          "})\n"
+          "text",
+          "<p>text</p><footer class=\"note\">end</footer>");
+
+    check("a document with no transform takes the shorter path",
+          "= Untouched", "<h1 id=\"untouched\">Untouched</h1>");
+
+    /*
+     * ATTRIBUTE ORDER through the round trip, which is worth pinning because
+     * it looks like a bug and is not.
+     *
+     * An element written `href class rel title` comes back `href title class
+     * rel` after passing through a transform — and mdy-docs does exactly the
+     * same, under node and under the QuickJS build alike. The expectation
+     * below is what `node bin/mdy.js build` produces for this document, taken
+     * from it rather than reasoned out.
+     *
+     * (lamassu does not keep objects in insertion order, which the language
+     * requires — see js_object_key_at's note. It does not decide this case,
+     * but it is a real gap and this is the check that would notice if it
+     * started to.)
+     */
+    check("attribute order matches what mdy-docs produces",
+          "%% transform((tree) => {})\n"
+          "<a href=\"/x\" class=\"one two\" rel=\"noopener\" title=\"t\">link",
+          "<a href=\"/x\" title=\"t\" class=\"one two\" rel=\"noopener\">link</a>");
+
+    refuses("a transform that returns something that is not a node",
+            "%% transform(() => 42)\n= x", "transform must return a hast node");
+
     printf("--- engine: what it refuses, loudly ---\n");
     refuses("a native that is not implemented yet",
             "{{ $.render({ role: 'card' }) }}", "$.render is not implemented");

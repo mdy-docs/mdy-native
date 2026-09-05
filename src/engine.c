@@ -11,11 +11,19 @@
 #include "mdydata.h"
 #include "mdydoc.h"
 #include "mdyhtml.h"
+#include "mdybuild.h"
 #include "mdyscript.h"
+#include "toolkit.h"
 
 struct mdy_engine {
     JsVm *vm;
     JsContext *ctx;
+    /*
+     * The render in progress. `$.compose` is a host call made from the middle
+     * of one, and it needs the document being rendered; with one render at a
+     * time this is where it lives.
+     */
+    mdy_doc *tree_owner;
 };
 
 /* ---- strings across the boundary ------------------------------------------- */
@@ -78,6 +86,177 @@ static JsValue key(JsVm *vm, const char *s) {
     return v;
 }
 
+/* ---- a tree, across the boundary --------------------------------------------
+ *
+ * `transform((tree) => …)` is the one place a document's own code sees the
+ * tree, so the tree has to reach the guest and come back. mdy-docs sends it as
+ * JSON in both directions; here it is built as VALUES, which is what
+ * js_array_new and js_object_new made possible.
+ *
+ * The shape is hast's, exactly as the JSON was: every node has a `type`, an
+ * element has `tagName`, `properties` and `children`, and a text node has a
+ * `value`. A transform written against one works against the other.
+ */
+
+static JsValue tree_to_js(mdy_engine *e, const mdy_node *n);
+
+static JsValue children_to_js(mdy_engine *e, const mdy_node *n) {
+    JsValue array = js_array_new(e->ctx, 0);
+    js_gc_protect(e->vm, &array);
+    for (const mdy_node *c = n->first; c; c = c->next) {
+        JsValue child = tree_to_js(e, c);
+        js_gc_protect(e->vm, &child);
+        js_array_push(e->vm, array, child);
+        js_gc_unprotect(e->vm, &child);
+    }
+    js_gc_unprotect(e->vm, &array);
+    return array;
+}
+
+static JsValue tree_to_js(mdy_engine *e, const mdy_node *n) {
+    JsValue o = js_object_new(e->ctx);
+    js_gc_protect(e->vm, &o);
+
+    switch (n->type) {
+        case MDY_TEXT:
+        case MDY_RAW:
+        case MDY_COMMENT: {
+            const char *type = n->type == MDY_TEXT ? "text"
+                             : n->type == MDY_RAW ? "raw" : "comment";
+            js_object_set(e->vm, o, key(e->vm, "type"), str(e->vm, type, strlen(type)));
+            const char *v = n->text ? n->text : "";
+            js_object_set(e->vm, o, key(e->vm, "value"), str(e->vm, v, strlen(v)));
+            break;
+        }
+        case MDY_DOCTYPE:
+            js_object_set(e->vm, o, key(e->vm, "type"), str(e->vm, "doctype", 7));
+            break;
+        case MDY_ROOT:
+            js_object_set(e->vm, o, key(e->vm, "type"), str(e->vm, "root", 4));
+            js_object_set(e->vm, o, key(e->vm, "children"), children_to_js(e, n));
+            break;
+        case MDY_ELEMENT: {
+            js_object_set(e->vm, o, key(e->vm, "type"), str(e->vm, "element", 7));
+            js_object_set(e->vm, o, key(e->vm, "tagName"), str(e->vm, n->tag, strlen(n->tag)));
+            JsValue props = js_object_new(e->ctx);
+            js_gc_protect(e->vm, &props);
+            for (const mdy_prop *p = n->props; p; p = p->next) {
+                JsValue v;
+                switch (p->type) {
+                    case MDY_PROP_STRING: v = str(e->vm, p->as.string, strlen(p->as.string)); break;
+                    case MDY_PROP_NUMBER: v = js_number(p->as.number); break;
+                    case MDY_PROP_BOOL:   v = js_bool(p->as.boolean != 0); break;
+                    case MDY_PROP_LIST: {
+                        v = js_array_new(e->ctx, (uint32_t)p->list_len);
+                        js_gc_protect(e->vm, &v);
+                        for (size_t i = 0; i < p->list_len; i++)
+                            js_array_push(e->vm, v, str(e->vm, p->list[i], strlen(p->list[i])));
+                        js_gc_unprotect(e->vm, &v);
+                        break;
+                    }
+                    default: v = js_undefined();
+                }
+                js_object_set(e->vm, props, key(e->vm, p->name), v);
+            }
+            js_object_set(e->vm, o, key(e->vm, "properties"), props);
+            js_gc_unprotect(e->vm, &props);
+            js_object_set(e->vm, o, key(e->vm, "children"), children_to_js(e, n));
+            break;
+        }
+    }
+
+    js_gc_unprotect(e->vm, &o);
+    return o;
+}
+
+/* The string a JS value holds, as UTF-8. Caller frees. NULL when it is not a
+ * string — which for a `type` or a `tagName` means the guest handed back
+ * something that is not a node. */
+static char *js_string_utf8(JsValue v) {
+    size_t ulen = 0;
+    const uint16_t *u = js_string_units(v, &ulen);
+    return u ? from_utf16(u, ulen) : NULL;
+}
+
+static mdy_node *js_to_tree(mdy_engine *e, mdy_doc *doc, JsValue v);
+
+static void js_children_to_tree(mdy_engine *e, mdy_doc *doc, mdy_node *parent, JsValue kids) {
+    if (!js_is_array(kids)) return;
+    uint32_t n = js_array_length(kids);
+    for (uint32_t i = 0; i < n; i++) {
+        mdy_node *child = js_to_tree(e, doc, js_array_get(kids, i));
+        if (child) mdy_append(parent, child);
+    }
+}
+
+static mdy_node *js_to_tree(mdy_engine *e, mdy_doc *doc, JsValue v) {
+    if (!js_is_object(v)) return NULL;
+
+    char *type = js_string_utf8(js_object_get(e->vm, v, key(e->vm, "type")));
+    if (!type) return NULL;
+
+    mdy_node *out = NULL;
+    if (strcmp(type, "text") == 0 || strcmp(type, "raw") == 0 || strcmp(type, "comment") == 0) {
+        char *value = js_string_utf8(js_object_get(e->vm, v, key(e->vm, "value")));
+        out = mdy_new_text(doc, value ? value : "", value ? strlen(value) : 0);
+        if (out) out->type = strcmp(type, "raw") == 0 ? MDY_RAW
+                           : strcmp(type, "comment") == 0 ? MDY_COMMENT : MDY_TEXT;
+        free(value);
+    } else if (strcmp(type, "doctype") == 0) {
+        out = mdy_new_text(doc, "", 0);
+        if (out) out->type = MDY_DOCTYPE;
+    } else if (strcmp(type, "root") == 0) {
+        out = mdy_new_text(doc, "", 0);
+        if (out) {
+            out->type = MDY_ROOT;
+            out->text = NULL;
+            js_children_to_tree(e, doc, out, js_object_get(e->vm, v, key(e->vm, "children")));
+        }
+    } else if (strcmp(type, "element") == 0) {
+        char *tag = js_string_utf8(js_object_get(e->vm, v, key(e->vm, "tagName")));
+        out = mdy_new_element(doc, tag ? tag : "div", tag ? strlen(tag) : 3);
+        free(tag);
+        if (out) {
+            /*
+             * Properties come back by NAME, and the names a guest may have
+             * added are not known in advance — so this walks whatever is
+             * there rather than a fixed list. `className` is the one that is
+             * an array; everything else is a string, a number or a boolean.
+             */
+            JsValue props = js_object_get(e->vm, v, key(e->vm, "properties"));
+            if (js_is_object(props)) {
+                for (size_t i = 0; i < js_object_size(props); i++) {
+                    JsValue name = js_object_key_at(props, i);
+                    char *pname = js_string_utf8(name);
+                    if (!pname) continue;
+                    JsValue pv = js_object_get(e->vm, props, name);
+                    if (js_is_array(pv)) {
+                        uint32_t n = js_array_length(pv);
+                        for (uint32_t k = 0; k < n; k++) {
+                            char *item = js_string_utf8(js_array_get(pv, k));
+                            if (item && strcmp(pname, "className") == 0) mdy_add_class(doc, out, item);
+                            free(item);
+                        }
+                    } else if (js_is_number(pv)) {
+                        mdy_set_number(doc, out, pname, js_get_number(pv));
+                    } else if (js_is_bool(pv)) {
+                        mdy_set_bool(doc, out, pname, js_get_bool(pv));
+                    } else {
+                        char *sv = js_string_utf8(pv);
+                        if (sv) mdy_set_string(doc, out, pname, sv, strlen(sv));
+                        free(sv);
+                    }
+                    free(pname);
+                }
+            }
+            js_children_to_tree(e, doc, out, js_object_get(e->vm, v, key(e->vm, "children")));
+        }
+    }
+
+    free(type);
+    return out;
+}
+
 /* ---- `$`, with every native refusing ---------------------------------------
  *
  * A native that is not implemented THROWS, naming itself. The alternative — a
@@ -105,12 +284,51 @@ static bool refuse(JsContext *ctx, JsValue this_val, const JsValue *args, int ar
     return false;
 }
 
-static void register_natives(mdy_engine *e) {
+/*
+ * `$.compose(__out)` — the one native step 2 implements, and the reason the
+ * tree conversions exist.
+ *
+ * A document with a `transform` needs its own finished tree, so the host takes
+ * the lines it produced, parses them, and hands the tree BACK to the guest as
+ * values. The guest transforms it and returns it; the host converts it back
+ * and writes the HTML. mdy-docs does the same thing with JSON in both
+ * directions.
+ */
+static mdy_doc *parse_lines(JsValue out, mdy_engine *e);
+
+static bool compose_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                           int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    if (argc < 1 || !js_is_array(args[0])) {
+        const char *msg = "mdy-engine: $.compose wants the lines a document produced";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    mdy_doc *tree = parse_lines(args[0], e);
+    if (!tree) {
+        const char *msg = "mdy-engine: the produced lines did not parse";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    /* The document owns the tree until the render finishes with it. */
+    mdy_free(e->tree_owner);
+    e->tree_owner = tree;
+    *result = tree_to_js(e, mdy_root(tree));
+    return true;
+}
+
+static void register_one(mdy_engine *e, const char *name, JsNativeFn fn) {
     size_t n = 0;
-    uint16_t *u = to_utf16("__native", 8, &n);
+    uint16_t *u = to_utf16(name, strlen(name), &n);
     if (!u) return;
-    js_register_native(e->ctx, u, n, refuse, NULL);
+    js_register_native(e->ctx, u, n, fn, NULL);
     free(u);
+}
+
+static void register_natives(mdy_engine *e) {
+    register_one(e, "__native", refuse);
+    register_one(e, "__compose", compose_native);
 }
 
 /*
@@ -136,12 +354,15 @@ mdy_engine *mdy_engine_new(void) {
     if (!e->vm) { free(e); return NULL; }
     e->ctx = js_context_new(e->vm);
     if (!e->ctx) { js_vm_free(e->vm); free(e); return NULL; }
+    /* So a native can find the engine it belongs to. */
+    js_context_set_userdata(e->ctx, e);
     register_natives(e);
     return e;
 }
 
 void mdy_engine_free(mdy_engine *e) {
     if (!e) return;
+    mdy_free(e->tree_owner);
     js_context_free(e->ctx);
     js_vm_free(e->vm);
     free(e);
@@ -186,12 +407,37 @@ static char *wrap(const char *statements) {
         "  table: (r, a) => __native('table', r, a),\n"
         "  toc: (t) => __native('toc', t),\n"
         "  data: (i) => __native('data', i),\n"
-        "  compose: (o) => __native('compose', o),\n"
-        "};\n";
-    static const char CLOSE[] = "\nreturn __out\n})";
-    size_t n = strlen(OPEN) + strlen(statements) + strlen(CLOSE) + 1;
+        "  compose: (o) => __compose(o),\n"
+        "};\n"
+        "const __transforms = [];\n"
+        "const transform = (fn) => { __transforms.push(fn); };\n";
+
+    /*
+     * The epilogue, which is mdy-docs' own: a document with no transform hands
+     * back its LINES and the host composes them; one with a transform asks for
+     * its tree, runs each transform over it, and hands the TREE back. The two
+     * shapes are told apart by which key the result carries.
+     */
+    static const char CLOSE[] =
+        "\nif (__transforms.length > 0) {\n"
+        "  let __tree = $.compose(__out);\n"
+        "  res.doc = __tree;\n"
+        "  for (const fn of __transforms) {\n"
+        "    const returned = fn(__tree);\n"
+        "    if (returned !== undefined && returned !== null) {\n"
+        "      if (typeof returned !== \"object\" || typeof returned.type !== \"string\") {\n"
+        "        throw \"transform must return a hast node ({ type, ... }), or undefined after changing the tree in place\";\n"
+        "      }\n"
+        "      __tree = returned;\n"
+        "    }\n"
+        "    res.doc = __tree;\n"
+        "  }\n"
+        "  return { tree: __tree };\n"
+        "}\n"
+        "return { out: __out };\n})";
+    size_t n = strlen(OPEN) + strlen(MDY_TOOLKIT) + strlen(statements) + strlen(CLOSE) + 1;
     char *out = malloc(n);
-    if (out) snprintf(out, n, "%s%s%s", OPEN, statements, CLOSE);
+    if (out) snprintf(out, n, "%s%s%s%s", OPEN, MDY_TOOLKIT, statements, CLOSE);
     return out;
 }
 
@@ -229,6 +475,28 @@ static char *flatten(JsValue out, size_t *out_len) {
     }
     *out_len = len;
     return text;
+}
+
+/* The lines a document produced, parsed — what `$.compose` returns and what a
+ * document with no transform gets at the end. */
+static mdy_doc *parse_lines(JsValue out, mdy_engine *e) {
+    (void)e;
+    size_t text_len = 0;
+    char *text = flatten(out, &text_len);
+    if (!text) return NULL;
+
+    mdy_options options;
+    mdy_options_default(&options);
+    /* What the document engine asks the parser for: it has already taken the
+     * front matter off and split the documents, and the code has already run
+     * — so all three are the parser's business no longer. */
+    options.frontmatter = 0;
+    options.documents = 0;
+    options.sanitize = 0;
+
+    mdy_doc *tree = mdy_parse(text, text_len, &options);
+    free(text);
+    return tree;
 }
 
 char *mdy_engine_render(mdy_engine *e, const char *source, size_t len,
@@ -320,31 +588,33 @@ char *mdy_engine_render(mdy_engine *e, const char *source, size_t len,
         js_gc_protect(e->vm, &result);
     }
 
-    if (!js_is_array(result)) FAIL("the document did not produce its lines");
+    if (!js_is_object(result)) FAIL("the document did not produce a result");
 
-    /* 3. the lines, parsed */
-    size_t text_len = 0;
-    char *text = flatten(result, &text_len);
-    if (!text) FAIL("out of memory");
-
-    mdy_options options;
-    mdy_options_default(&options);
-    /* What the document engine asks the parser for: it has already taken the
-     * front matter off and split the documents, and the code has already run
-     * — so all three are the parser's business no longer. */
-    options.frontmatter = 0;
-    options.documents = 0;
-    options.sanitize = 0;
-
-    mdy_doc *tree = mdy_parse(text, text_len, &options);
-    free(text);
-    if (!tree) FAIL("the produced lines did not parse");
-
-    html = mdy_to_html(mdy_root(tree), NULL);
-    mdy_free(tree);
+    /*
+     * 3. the tree. A document with a transform already has one — it asked for
+     * it through `$.compose` and handed back what its transforms made of it —
+     * and one without hands back its lines for the host to parse.
+     */
+    JsValue transformed = js_object_get(e->vm, result, key(e->vm, "tree"));
+    if (js_is_object(transformed)) {
+        mdy_doc *doc = mdy_doc_new();
+        if (!doc) FAIL("out of memory");
+        mdy_node *root = js_to_tree(e, doc, transformed);
+        html = mdy_to_html(root ? root : mdy_root(doc), NULL);
+        mdy_free(doc);
+    } else {
+        JsValue out = js_object_get(e->vm, result, key(e->vm, "out"));
+        if (!js_is_array(out)) FAIL("the document did not produce its lines");
+        mdy_doc *tree = parse_lines(out, e);
+        if (!tree) FAIL("the produced lines did not parse");
+        html = mdy_to_html(mdy_root(tree), NULL);
+        mdy_free(tree);
+    }
 
 done:
 #undef FAIL
+    mdy_free(e->tree_owner);
+    e->tree_owner = NULL;
     mdy_script_free(script);
     mdy_data_free(data);
     mdy_documents_free(docs);

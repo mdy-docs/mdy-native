@@ -607,13 +607,32 @@ request.
 undefined produces a page quietly missing whatever the document asked for,
 which is the failure this project has been most careful to avoid.
 
-Two gaps in lamassu's API are worth naming, because they are the same small
-addition `js_array_new` was. There is no `js_function_new`, only
-`js_register_native` for globals — so `$` is built in the wrapper source over
-one global native rather than as an object of native function values. And a
-render's positions point at the GENERATED lines rather than the source ones:
-mdy-docs carries a line map from the script layer into the parser and this does
-not yet, which changes no HTML, only where a warning would say it came from.
+### transform: the tree through lamassu and back
+
+`transform((tree) => …)` is the one place a document's own code sees its tree,
+so the tree has to reach the guest and come back. mdy-docs sends it as JSON in
+both directions; here it is built as **values** — which is what `js_array_new`,
+`js_object_key_at` and `js_context_userdata` were added to lamassu for.
+
+The epilogue is mdy-docs' own: a document with no transform hands back its
+LINES and the host composes them; one with a transform asks for its tree
+through `$.compose`, runs each transform over it, and hands the TREE back. The
+four names a document can use — `toText`, `slug`, `visit`, `h` — are spliced in
+as guest source, generated from mdy.js by `scripts-toolkit.mjs` rather than
+kept as a copy that can drift.
+
+One result is worth recording because it looks like a bug and is not. An
+element written `href class rel title` comes back `href title class rel` after
+a transform — and mdy-docs does the same, under node and under the QuickJS
+build alike. `check-engine` pins the order against what `node bin/mdy.js build`
+produces.
+
+Two gaps remain. There is no `js_function_new`, only `js_register_native` for
+globals — so `$` is built in the wrapper source over one global native rather
+than as an object of native function values. And a render's positions point at
+the GENERATED lines rather than the source ones: mdy-docs carries a line map
+from the script layer into the parser and this does not yet, which changes no
+HTML, only where a warning would say it came from.
 
 ## Next
 
