@@ -75,6 +75,20 @@ const char *mdy_engine_root_at(mdy_engine *engine, size_t index);
  * directory starts unless a caller says otherwise. */
 int mdy_engine_entry(mdy_engine *engine, const char *entry);
 
+/*
+ * Where a `$.publish` goes. `$.emit` writes an output; publish sends a
+ * message to a page of this set BY NAME, and what happens to it is the
+ * embedder's — exactly as an emitted output is. Core's whole job is deciding
+ * that the name means a page, and refusing when it names none or several.
+ *
+ * `data_json` is the message's data as JSON, produced by the guest's own
+ * JSON.stringify. `doc_index` is the document that published it.
+ */
+void mdy_engine_on_publish(mdy_engine *engine,
+                           void (*fn)(void *ud, const char *name,
+                                      const char *data_json, size_t doc_index),
+                           void *ud);
+
 /* How many documents the open set holds. */
 size_t mdy_engine_count(mdy_engine *engine);
 

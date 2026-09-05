@@ -278,6 +278,144 @@ static void gc_checks(void) {
     mdy_engine_free(e);
 }
 
+
+/* Where a `$.publish` landed, for the checks below. */
+static char last_message[512];
+static int message_count;
+
+static void collect_message(void *ud, const char *name, const char *data_json,
+                            size_t doc_index) {
+    (void)ud;
+    snprintf(last_message, sizeof last_message, "%s %s from %zu", name, data_json, doc_index);
+    message_count++;
+}
+
+static void natives_checks(void) {
+    printf("\n--- engine: the rest of `$` ---\n");
+
+    /*
+     * The tree a document did not write itself. All of these end in a token
+     * except `$.parse`, which hands back the TREE — its whole purpose is to be
+     * looked at — and `$.html`, which is the way back out to text.
+     *
+     * Every expectation here was taken from `node bin/mdy.js build` on the
+     * same source.
+     */
+    /*
+     * `$.html` returns a STRING, and a string written into a document is
+     * TEXT — so the markup in it is escaped when the document is read, and an
+     * `= ` at the start of the line still opens a heading. That is the whole
+     * reason `$.node` and the rest hand back tokens instead: a token is a
+     * tree, and a tree goes in as nodes.
+     *
+     * Both expectations here were wrong the first time and both were taken
+     * from `node bin/mdy.js build` on this exact source.
+     */
+    check("$.parse reads MDY and gives back a tree",
+          "{{ $.html($.parse('= A heading')) }}",
+          "<h1 id=\"a-heading\">A heading&#x3C;/h1></h1>");
+    check("$.markdown is the other front end",
+          "{{ $.markdown('# Md heading') }}",
+          "<h1 id=\"md-heading\">Md heading</h1>");
+    check("$.node parks a tree the document built",
+          "{{ $.node({ type: 'element', tagName: 'p', properties: { className: ['x'] },"
+          " children: [{ type: 'text', value: 'built' }] }) }}",
+          "<p class=\"x\">built</p>");
+    check("$.table, with a cell read as MDY",
+          "{{ $.table([['Name'], ['**old**']]) }}",
+          "<table><thead><tr><th>Name</th></tr></thead>"
+          "<tbody><tr><td><strong>old</strong></td></tr></tbody></table>");
+    check("...and an alignment per column",
+          "{{ $.table([['A', 'B']], ['left', 'right']) }}",
+          "<table><thead><tr><th style=\"text-align: left\">A</th>"
+          "<th style=\"text-align: right\">B</th></tr></thead></table>");
+    check("a table cell that is not one paragraph stays the text it was",
+          "{{ $.table([['H'], ['- one\\n- two']]) }}",
+          "<table><thead><tr><th>H</th></tr></thead>"
+          "<tbody><tr><td>- one\n- two</td></tr></tbody></table>");
+    check("$.html turns a token in a string into its HTML",
+          "% const frag = $.render(1)\n{{ $.html('before ' + frag + ' after') }}\n"
+          "---\n**frag**\n",
+          "<p>before &#x3C;p>&#x3C;strong>frag&#x3C;/strong>&#x3C;/p> after</p>");
+
+    /*
+     * `$.toc()` returns a token before there is anything to put in it, and
+     * that is the point: the list has to be able to name a heading a loop
+     * writes BELOW it.
+     */
+    check("$.toc() names a heading written after it",
+          "< nav\n  {{ $.toc() }}\n% for (const c of ['Uruk', 'Akkad']) {\n== {{ c }}\n% }\n",
+          "<nav>\n<ul><li><a href=\"#uruk\">Uruk</a></li>"
+          "<li><a href=\"#akkad\">Akkad</a></li></ul>\n</nav>"
+          "<h2 id=\"uruk\">Uruk</h2><h2 id=\"akkad\">Akkad</h2>");
+    check("...and nests a deeper heading, then comes back OUT of it",
+          "{{ $.toc() }}\n= One\n== Two\n= Three\n",
+          "<ul><li><a href=\"#one\">One</a><ul><li><a href=\"#two\">Two</a></li></ul></li>"
+          "<li><a href=\"#three\">Three</a></li></ul>"
+          "<h1 id=\"one\">One</h1><h2 id=\"two\">Two</h2><h1 id=\"three\">Three</h1>");
+    /* A heading the parser did not give an id to cannot be linked, so it is
+     * not listed. Raw HTML is how one gets written. */
+    check("...and skips a heading with no id to link to",
+          "{{ $.toc() }}\n<h2>Raw heading\n= Real\n",
+          "<ul><li><a href=\"#real\">Real</a></li></ul>"
+          "<h2>Raw heading</h2><h1 id=\"real\">Real</h1>");
+    check("...and disappears entirely when nothing can be listed",
+          "{{ $.toc() }}\n<p>plain\n", "<p>plain</p>");
+    check("$.toc(text) is a question, not a token",
+          "{{ JSON.stringify($.toc('= One\\n\\n== Two')) }}",
+          "<p>[{\"depth\":1,\"text\":\"One\",\"slug\":\"one\"},"
+          "{\"depth\":2,\"text\":\"Two\",\"slug\":\"two\"}]</p>");
+    check("...and takes a rendered document too",
+          "{{ JSON.stringify($.toc($.render(1))) }}\n---\n= Zed\n",
+          "<p>[{\"depth\":1,\"text\":\"Zed\",\"slug\":\"zed\"}]</p>");
+
+    refuses("$.node wants a hast node", "{{ $.node('nope') }}",
+            "expects a hast node");
+    refuses("$.table wants rows", "{{ $.table('nope') }}",
+            "array of row arrays");
+    refuses("$.toc wants something it can read", "{{ $.toc(42) }}",
+            "expects MDY text, a hast node, or a rendered document");
+
+    /* ---- publishing ---- */
+    {
+        const char *source =
+            "% $.publish('handlers.invoice', { total: 3 })\n"
+            "---\n+++\npath: handlers/invoice.mdy\next: .mdy\n+++\n= Invoice\n";
+        mdy_engine *e = mdy_engine_new();
+        char err[256];
+        message_count = 0;
+        last_message[0] = '\0';
+        mdy_engine_on_publish(e, collect_message, NULL);
+        char *html = NULL;
+        if (mdy_engine_open(e, source, strlen(source), err, sizeof err) == 0)
+            html = mdy_engine_render(e, 0, err, sizeof err);
+        ok_("a page's name is its path without the extension",
+            message_count == 1 &&
+                strcmp(last_message, "handlers.invoice {\"total\":3} from 1") == 0,
+            last_message[0] ? last_message : err);
+        free(html);
+        mdy_engine_free(e);
+    }
+
+    refuses("publishing to a name no document answers to",
+            "% $.publish('nowhere.at.all', {})\n",
+            "no document is named \"nowhere.at.all\"");
+    refuses("...or to one that several share",
+            "% $.publish('x', {})\n"
+            "---\n+++\npath: a/one.mdy\next: .mdy\nmessageName: x\n+++\n= A\n"
+            "---\n+++\npath: b/two.mdy\next: .mdy\nmessageName: x\n+++\n= B\n",
+            "is ambiguous");
+    refuses("...or to a name that is not one",
+            "% $.publish('bad name!', {})\n",
+            "may only contain letters, digits");
+    /* A record with nothing to run is not an endpoint — which is also what
+     * stops static/logo.png and static/logo.jpg colliding on static.logo. */
+    refuses("a record that is not a page is not addressable",
+            "% $.publish('static.logo', {})\n"
+            "---\n+++\npath: static/logo.png\next: .png\n+++\n",
+            "no document is named \"static.logo\"");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("[main]\n");
@@ -632,8 +770,10 @@ int main(void) {
             "%% transform(() => 42)\n= x", "transform must return a hast node");
 
     printf("--- engine: what it refuses, loudly ---\n");
+    /* `$.resize` is the one native left, and it is left on purpose: it needs
+     * JPEG and PNG codecs, which is a dependency rather than a port. */
     refuses("a native that is still not implemented",
-            "{{ $.toc() }}", "$.toc is not implemented");
+            "{{ $.resize({}, {}) }}", "$.resize is not implemented");
     refuses("a render of a document that is not there",
             "{{ $.render({ role: 'nowhere' }) }}", "found no such document");
     refuses("code that does not compile", "% const = \n= x", "did not compile");
@@ -653,6 +793,7 @@ int main(void) {
     }
 
     site_checks();
+    natives_checks();
     gc_checks();
 
     if (failures) { printf("\n%d failed\n", failures); return 1; }

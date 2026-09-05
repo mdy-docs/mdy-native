@@ -602,10 +602,32 @@ The statements are wrapped as `(async (req, res, $$) => { … })`, so `req` and
 the whole reason the script layer produces statements that never mention the
 request.
 
-**`$` refuses, loudly.** Every native is present and throws with its own name
-— `$.render is not implemented in the C engine yet` — because a stub returning
+**`$` is complete but for one native.** `find`, `findOne`, `withTag`, `data`,
+`render`, `text`, `emit`, `compose`, `parse`, `markdown`, `node`, `html`,
+`table`, `toc`, `publish`, `tokenize` and `rfc822` all work, and each was
+checked against `node bin/mdy.js build` on the same source rather than against
+what it looked like it should do — twice that disagreed with the expectation
+written here first, and node was right both times.
+
+`$.resize` is the exception, and it is a DEPENDENCY rather than a port: it
+needs JPEG and PNG codecs. It refuses by name, as everything did before —
+`$.resize is not implemented in the C engine yet` — because a stub returning
 undefined produces a page quietly missing whatever the document asked for,
 which is the failure this project has been most careful to avoid.
+
+Two of them are worth knowing about because their shape is not the obvious one:
+
+- **`$.parse` hands back a TREE; the rest hand back tokens.** A token is how a
+  finished tree travels through a document's own code, and it goes back in
+  where the parser knows what is open. `$.parse` is the exception because its
+  whole purpose is to be looked at. `$.html` is the way back out to text — and
+  a string of HTML written into a document is TEXT, so its markup is escaped.
+  That is the reason the others do not return strings.
+- **`$.toc()` returns a token before there is anything to put in it.** A
+  document's headings are not known until its whole tree is, so a contents
+  list at the top can name a heading a loop writes below it. It is filled last,
+  after the transforms, which is also why its links use the parser's own ids
+  and nothing has to agree with anything.
 
 ### The set, queried
 

@@ -18,12 +18,19 @@
 #include "ingest.h"
 
 #include "mdybuild.h"
+#include "mdymarkdown.h"
 #include "mdyscript.h"
 #include "mdytext.h"
 #include "toolkit.h"
 
 /* A tree a `$.render` parked, and the id of the token standing for it. */
-typedef struct { char id[24]; mdy_doc *doc; mdy_node *tree; } Held;
+/*
+ * A parked tree, or a promise of one. `tree == NULL` with `is_toc` set is a
+ * contents list: the token exists before the list can, because a document's
+ * headings are not known until its whole tree is — including the ones a loop
+ * below the contents list writes.
+ */
+typedef struct { char id[24]; mdy_doc *doc; mdy_node *tree; int is_toc; } Held;
 
 /* One document of an open set. Its TEXT is here; its DATA is in nisaba. */
 typedef struct {
@@ -88,6 +95,8 @@ struct mdy_engine {
     int depth;                  /* renders inside renders */
     void (*on_emit)(void *ud, const char *path, const char *content);
     void *on_emit_ud;
+    void (*on_publish)(void *ud, const char *name, const char *data_json, size_t doc_index);
+    void *on_publish_ud;
     /* `_id` to index, in insertion order, so a hit maps back to its document. */
     uint8_t (*ids)[12];
 
@@ -645,6 +654,7 @@ static char *hold_tree(mdy_engine *e, mdy_doc *doc, mdy_node *tree) {
     snprintf(h->id, sizeof h->id, "%zu", t->next_token++);
     h->doc = doc;
     h->tree = tree;
+    h->is_toc = 0;
 
     size_t n = strlen(TOKEN_OPEN) + strlen(h->id) + strlen(TOKEN_CLOSE) + 1;
     char *token = malloc(n);
@@ -1505,6 +1515,8 @@ static int open_dir_inner(mdy_engine *e, const char *root, ImportCache *cache,
          * outputs as the site that imported it. */
         child->on_emit = e->on_emit;
         child->on_emit_ud = e->on_emit_ud;
+        child->on_publish = e->on_publish;
+        child->on_publish_ud = e->on_publish_ud;
         child->tokens = token_table(e);
         /* In the cache before it is built, so a package that imports itself
          * through a diamond finds the one in progress rather than starting a
@@ -2075,6 +2087,14 @@ void mdy_engine_on_emit(mdy_engine *e,
     e->on_emit_ud = ud;
 }
 
+void mdy_engine_on_publish(mdy_engine *e,
+                           void (*fn)(void *ud, const char *name,
+                                      const char *data_json, size_t doc_index),
+                           void *ud) {
+    e->on_publish = fn;
+    e->on_publish_ud = ud;
+}
+
 /* ---- querying ---------------------------------------------------------------
  *
  * A hit carries the `_id` it was inserted with, so it maps back to the
@@ -2446,6 +2466,640 @@ static bool import_find_one_native(JsContext *ctx, JsValue this_val, const JsVal
     return import_query_native(ctx, this_val, args, argc, result, 1);
 }
 
+
+/* ---- the trees a document builds for itself ---------------------------------
+ *
+ * `$.parse`, `$.markdown`, `$.node`, `$.table` and `$.html`: the ways a
+ * document gets a tree that did not come from its own text, and the way one
+ * goes back out as HTML.
+ *
+ * All but `$.html` end in a token, for the reason `$.render` does — a tree
+ * travels through a document's own code as a few private-use characters, and
+ * goes back in where the parser knows what is open. `$.parse` is the
+ * exception on the other side: it hands back the TREE, because its whole
+ * purpose is to be looked at.
+ */
+
+/* The options the document engine asks the parser for: front matter, document
+ * splitting and the script layer are all already done by the time a document
+ * calls one of these. */
+static void parse_options(mdy_options *options) {
+    mdy_options_default(options);
+    options->frontmatter = 0;
+    options->documents = 0;
+    options->sanitize = 0;
+}
+
+/* MDY text as a tree, with any tokens in it spliced — `$.parse` is handed to
+ * code that will read the tree, so a `$.render` inside the text has to have
+ * become its nodes by then. */
+static bool parse_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                         int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    char *text = argc > 0 ? js_string_utf8(args[0]) : NULL;
+
+    mdy_options options;
+    parse_options(&options);
+    mdy_doc *doc = mdy_parse(text ? text : "", text ? strlen(text) : 0, &options);
+    free(text);
+    if (!doc) {
+        const char *msg = "mdy-engine: $.parse could not read that as MDY";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    splice_tree(e, doc, (mdy_node *)mdy_root(doc));
+    *result = tree_to_js(e, mdy_root(doc));
+    /* The document owns it until the render finishes: the value handed back is
+     * a copy in the VM, but a token spliced into it points at held nodes. */
+    hold_tree(e, doc, (mdy_node *)mdy_root(doc));
+    return true;
+}
+
+/* Markdown as a tree — the OTHER front end, for a `.md` file's body or any
+ * markdown a document holds and wants as nodes. */
+static bool markdown_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                            int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    char *text = argc > 0 ? js_string_utf8(args[0]) : NULL;
+    mdy_doc *doc = mdy_markdown_parse(text ? text : "", text ? strlen(text) : 0);
+    free(text);
+    if (!doc) {
+        const char *msg = "mdy-engine: $.markdown could not read that as Markdown";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    char *token = hold_tree(e, doc, (mdy_node *)mdy_root(doc));
+    if (!token) { *result = js_undefined(); return true; }
+    *result = str(e->vm, token, strlen(token));
+    free(token);
+    return true;
+}
+
+/*
+ * A tree the document built ITSELF — with `h`, by hand, or in a module it
+ * imported — parked like any other and spliced where its token lands.
+ *
+ * This is what a helper that used to return a string of HTML returns instead:
+ * hast is plain data, so it crosses as it is, and a fragment built this way is
+ * a node from the start rather than text somebody has to parse back.
+ */
+static bool node_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                        int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    if (argc < 1 || !js_is_object(args[0]) ||
+        !js_is_string(js_object_get(e->vm, args[0], key(e->vm, "type")))) {
+        const char *msg = "mdy: $.node expects a hast node ({ type, … })";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    mdy_doc *doc = mdy_doc_new();
+    if (!doc) { *result = js_undefined(); return true; }
+    mdy_node *root = js_to_tree(e, doc, args[0]);
+    /*
+     * `mdy_doc` owns its root, so what came back is hung under it — a root
+     * lends its children, and a single element becomes the document's one
+     * child. The same thing `$.compose` does with a transform's return.
+     */
+    mdy_node *into = (mdy_node *)mdy_root(doc);
+    if (root && root->type == MDY_ROOT) {
+        for (mdy_node *c = root->first; c;) {
+            mdy_node *next = c->next;
+            c->next = NULL;
+            mdy_append(into, c);
+            c = next;
+        }
+    } else if (root) {
+        mdy_append(into, root);
+    }
+    char *token = hold_tree(e, doc, into);
+    if (!token) { *result = js_undefined(); return true; }
+    *result = str(e->vm, token, strlen(token));
+    free(token);
+    return true;
+}
+
+/* A tree, or a token standing for one, as HTML text. */
+static bool html_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                        int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+
+    if (argc > 0 && js_is_string(args[0])) {
+        /* Tokens in a string become the HTML of what they hold. */
+        char *s = js_string_utf8(args[0]);
+        char *filled = s ? fill_tokens(e, s, strlen(s)) : NULL;
+        free(s);
+        *result = str(e->vm, filled ? filled : "", filled ? strlen(filled) : 0);
+        free(filled);
+        return true;
+    }
+    if (argc < 1 || !js_is_object(args[0]) ||
+        !js_is_string(js_object_get(e->vm, args[0], key(e->vm, "type")))) {
+        const char *msg = "mdy: $.html expects a hast node ({ type, … }) or a string";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    mdy_doc *doc = mdy_doc_new();
+    if (!doc) { *result = js_undefined(); return true; }
+    mdy_node *root = js_to_tree(e, doc, args[0]);
+    char *html = root ? mdy_to_html(root, NULL) : NULL;
+    mdy_free(doc);
+    *result = str(e->vm, html ? html : "", html ? strlen(html) : 0);
+    free(html);
+    return true;
+}
+
+/*
+ * `$.table(rows, align)` — an array of row arrays, the first being the header.
+ *
+ * A cell's text is parsed as MDY, so a link or an emphasis in a cell is a
+ * link or an emphasis. A cell that parses to exactly one paragraph gives up
+ * that paragraph and contributes its children; anything else is kept as the
+ * text it was, which is what stops a cell holding a list from breaking the
+ * row apart.
+ */
+static const char *column_align(mdy_engine *e, JsValue align, uint32_t i) {
+    if (!js_is_array(align) || i >= js_array_length(align)) return NULL;
+    char *s = js_string_utf8(js_array_get(align, i));
+    if (!s) return NULL;
+    char first = s[0];
+    free(s);
+    if (first >= 'A' && first <= 'Z') first = (char)(first - 'A' + 'a');
+    if (first == 'l') return "left";
+    if (first == 'c') return "center";
+    if (first == 'r') return "right";
+    return NULL;
+}
+
+static void table_cell(mdy_engine *e, mdy_doc *doc, mdy_node *row,
+                       JsValue value, uint32_t i, int header, JsValue align) {
+    char *text = js_is_undefined(value) || js_is_null(value) ? NULL : js_string_utf8(value);
+    const char *body = text ? text : "";
+
+    mdy_node *cell = mdy_new_element(doc, header ? "th" : "td", 2);
+    const char *at = column_align(e, align, i);
+    if (at) {
+        char style[32];
+        int n = snprintf(style, sizeof style, "text-align: %s", at);
+        mdy_set_string(doc, cell, "style", style, (size_t)n);
+    }
+
+    mdy_options options;
+    parse_options(&options);
+    mdy_doc *parsed = mdy_parse(body, strlen(body), &options);
+    const mdy_node *root = parsed ? mdy_root(parsed) : NULL;
+    const mdy_node *only = root ? root->first : NULL;
+    int one_paragraph = only && !only->next && only->type == MDY_ELEMENT &&
+                        strcmp(only->tag, "p") == 0;
+    if (one_paragraph) {
+        for (const mdy_node *c = only->first; c; c = c->next) {
+            mdy_node *copy = mdy_clone(doc, c);
+            if (copy) mdy_append(cell, copy);
+        }
+    } else {
+        mdy_append(cell, mdy_new_text(doc, body, strlen(body)));
+    }
+    mdy_free(parsed);
+    free(text);
+    mdy_append(row, cell);
+}
+
+static bool table_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                         int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    JsValue rows = argc > 0 ? args[0] : js_undefined();
+    JsValue align = argc > 1 ? args[1] : js_undefined();
+
+    int shaped = js_is_array(rows);
+    for (uint32_t i = 0; shaped && i < js_array_length(rows); i++)
+        if (!js_is_array(js_array_get(rows, i))) shaped = 0;
+    if (!shaped) {
+        const char *msg = "mdy: $.table expects an array of row arrays (first row is the header)";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    if (!js_is_undefined(align) && !js_is_null(align) && !js_is_array(align)) {
+        const char *msg = "mdy: $.table align must be an array like ['left', 'center', 'right']";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    uint32_t count = js_array_length(rows);
+    if (count == 0) { *result = str(e->vm, "", 0); return true; }
+
+    mdy_doc *doc = mdy_doc_new();
+    if (!doc) { *result = js_undefined(); return true; }
+    mdy_node *table = mdy_new_element(doc, "table", 5);
+    mdy_node *thead = mdy_new_element(doc, "thead", 5);
+    mdy_node *head_row = mdy_new_element(doc, "tr", 2);
+    JsValue head = js_array_get(rows, 0);
+    for (uint32_t i = 0; i < js_array_length(head); i++)
+        table_cell(e, doc, head_row, js_array_get(head, i), i, 1, align);
+    mdy_append(thead, head_row);
+    mdy_append(table, thead);
+
+    if (count > 1) {
+        mdy_node *tbody = mdy_new_element(doc, "tbody", 5);
+        for (uint32_t r = 1; r < count; r++) {
+            mdy_node *tr = mdy_new_element(doc, "tr", 2);
+            JsValue cells = js_array_get(rows, r);
+            for (uint32_t i = 0; i < js_array_length(cells); i++)
+                table_cell(e, doc, tr, js_array_get(cells, i), i, 0, align);
+            mdy_append(tbody, tr);
+        }
+        mdy_append(table, tbody);
+    }
+    mdy_append((mdy_node *)mdy_root(doc), table);
+
+    char *token = hold_tree(e, doc, table);
+    if (!token) { *result = js_undefined(); return true; }
+    *result = str(e->vm, token, strlen(token));
+    free(token);
+    return true;
+}
+
+
+/* ---- a document's own contents list ------------------------------------------
+ *
+ * `$.toc()` returns a token before there is anything to put in it. That is the
+ * point: a document's headings are not known until its whole tree is, and a
+ * contents list at the top has to be able to name a heading a loop writes
+ * below it. So the token is parked empty and filled LAST, after the transforms
+ * have had the tree — which is also why the ids in it are the parser's own,
+ * and nothing has to agree with anything.
+ */
+
+static char *hold_toc(mdy_engine *e) {
+    char *token = hold_tree(e, NULL, NULL);
+    if (token) {
+        mdy_engine *t = token_table(e);
+        t->held[t->held_count - 1].is_toc = 1;
+    }
+    return token;
+}
+
+typedef struct { int depth; char *text; char *id; } Heading;
+
+/* All the text under a node, which is what a heading's entry reads. */
+static void heading_text(const mdy_node *n, char **buf, size_t *len, size_t *cap) {
+    collect_text_into(n, buf, len, cap);
+}
+
+static int heading_depth(const mdy_node *n) {
+    if (n->type != MDY_ELEMENT || !n->tag) return 0;
+    if (n->tag[0] != 'h' || n->tag[1] < '1' || n->tag[1] > '6' || n->tag[2]) return 0;
+    return n->tag[1] - '0';
+}
+
+static void collect_headings(const mdy_node *n, Heading **out, size_t *count, size_t *cap) {
+    int depth = heading_depth(n);
+    if (depth) {
+        if (*count == *cap) {
+            size_t want = *cap ? *cap * 2 : 16;
+            Heading *grown = realloc(*out, want * sizeof *grown);
+            if (!grown) return;
+            *out = grown;
+            *cap = want;
+        }
+        char *text = NULL;
+        size_t tlen = 0, tcap = 0;
+        heading_text(n, &text, &tlen, &tcap);
+        const char *id = NULL;
+        for (const mdy_prop *p = n->props; p; p = p->next)
+            if (strcmp(p->name, "id") == 0 && p->type == MDY_PROP_STRING) id = p->as.string;
+        (*out)[*count].depth = depth;
+        (*out)[*count].text = text ? text : calloc(1, 1);
+        (*out)[*count].id = id ? strdup(id) : NULL;
+        (*count)++;
+    }
+    for (const mdy_node *c = n->first; c; c = c->next)
+        collect_headings(c, out, count, cap);
+}
+
+/*
+ * A nested `<ul>`, or nothing when no heading carries an id — one list per
+ * depth, the deepest last: a heading goes in the list at its own level, and a
+ * level that opens goes inside the item above it.
+ */
+static mdy_node *toc_list(mdy_doc *doc, Heading *entries, size_t count) {
+    size_t listed = 0;
+    int min = 7;
+    for (size_t i = 0; i < count; i++)
+        if (entries[i].id) { listed++; if (entries[i].depth < min) min = entries[i].depth; }
+    if (listed == 0) return NULL;
+
+    mdy_node *root = mdy_new_element(doc, "ul", 2);
+    struct { int depth; mdy_node *list; } stack[8];
+    size_t top = 0;
+    stack[0].depth = min;
+    stack[0].list = root;
+
+    for (size_t i = 0; i < count; i++) {
+        if (!entries[i].id) continue;
+        while (top > 0 && entries[i].depth < stack[top].depth) top--;
+        while (entries[i].depth > stack[top].depth && top + 1 < 8) {
+            mdy_node *above = stack[top].list->last;
+            mdy_node *nested = mdy_new_element(doc, "ul", 2);
+            if (above) {
+                mdy_append(above, nested);
+            } else {
+                mdy_node *li = mdy_new_element(doc, "li", 2);
+                mdy_append(li, nested);
+                mdy_append(stack[top].list, li);
+            }
+            top++;
+            stack[top].depth = stack[top - 1].depth + 1;
+            stack[top].list = nested;
+        }
+        mdy_node *li = mdy_new_element(doc, "li", 2);
+        mdy_node *a = mdy_new_element(doc, "a", 1);
+        char href[512];
+        int n = snprintf(href, sizeof href, "#%s", entries[i].id);
+        mdy_set_string(doc, a, "href", href, (size_t)n);
+        mdy_append(a, mdy_new_text(doc, entries[i].text, strlen(entries[i].text)));
+        mdy_append(li, a);
+        mdy_append(stack[top].list, li);
+    }
+    return root;
+}
+
+static void free_headings(Heading *entries, size_t count) {
+    for (size_t i = 0; i < count; i++) { free(entries[i].text); free(entries[i].id); }
+    free(entries);
+}
+
+/*
+ * Fill every contents token in a finished tree. Run LAST, on the whole tree,
+ * so the headings are all of them and the ids are the parser's.
+ */
+static void splice_toc(mdy_engine *e, mdy_doc *doc, mdy_node *parent,
+                       Heading *entries, size_t count) {
+    mdy_node *child = parent->first;
+    parent->first = parent->last = NULL;
+
+    while (child) {
+        mdy_node *next = child->next;
+        child->next = NULL;
+
+        size_t len = 0;
+        const char *text = sole_text(child, &len);
+        char id[24];
+        if (text && only_tokens(text, len) && token_at(text, len, id, sizeof id)) {
+            Held *h = held_find(e, id);
+            if (h && h->is_toc) {
+                mdy_node *list = toc_list(doc, entries, count);
+                if (list) mdy_append(parent, list);
+                child = next;
+                continue;
+            }
+        }
+        splice_toc(e, doc, child, entries, count);
+        mdy_append(parent, child);
+        child = next;
+    }
+}
+
+static void fill_toc(mdy_engine *e, mdy_doc *doc) {
+    /* Nothing to do unless a token asked for one — the walk is not free. */
+    mdy_engine *t = token_table(e);
+    int wanted = 0;
+    for (size_t i = 0; i < t->held_count && !wanted; i++) wanted = t->held[i].is_toc;
+    if (!wanted) return;
+
+    Heading *entries = NULL;
+    size_t count = 0, cap = 0;
+    collect_headings(mdy_root(doc), &entries, &count, &cap);
+    splice_toc(e, doc, (mdy_node *)mdy_root(doc), entries, count);
+    free_headings(entries, count);
+}
+
+/*
+ * `$.toc()` with no argument is the token above. With one it is a QUESTION:
+ * the headings of what was passed, for a document that would rather build the
+ * list itself. MDY text, a hast node, or a rendered document (which arrives
+ * as a token, so that has to be accepted too).
+ */
+static bool toc_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                       int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+
+    if (argc < 1 || js_is_undefined(args[0])) {
+        char *token = hold_toc(e);
+        if (!token) { *result = js_undefined(); return true; }
+        *result = str(e->vm, token, strlen(token));
+        free(token);
+        return true;
+    }
+
+    const mdy_node *tree = NULL;
+    mdy_doc *owned = NULL;
+
+    if (js_is_string(args[0])) {
+        char *s = js_string_utf8(args[0]);
+        size_t slen = s ? strlen(s) : 0;
+        char id[24];
+        /* A token is how a rendered document travels, so `$.toc($.render(…))`
+         * is asking about THAT document, not about three characters. */
+        if (s && only_tokens(s, slen) && token_at(s, slen, id, sizeof id)) {
+            Held *h = held_find(e, id);
+            if (h) tree = h->tree;
+        } else {
+            mdy_options options;
+            parse_options(&options);
+            owned = mdy_parse(s ? s : "", slen, &options);
+            tree = owned ? mdy_root(owned) : NULL;
+        }
+        free(s);
+    } else if (js_is_object(args[0]) &&
+               js_is_string(js_object_get(e->vm, args[0], key(e->vm, "type")))) {
+        owned = mdy_doc_new();
+        tree = owned ? js_to_tree(e, owned, args[0]) : NULL;
+    }
+
+    if (!tree) {
+        mdy_free(owned);
+        const char *msg = "mdy: $.toc expects MDY text, a hast node, or a rendered document";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+
+    Heading *entries = NULL;
+    size_t count = 0, cap = 0;
+    collect_headings(tree, &entries, &count, &cap);
+
+    JsValue out = js_array_new(ctx, (uint32_t)count);
+    js_gc_protect(e->vm, &out);
+    for (size_t i = 0; i < count; i++) {
+        JsValue entry = js_object_new(e->ctx);
+        js_gc_protect(e->vm, &entry);
+        set_val(e, entry, "depth", js_number(entries[i].depth));
+        set_val(e, entry, "text", str(e->vm, entries[i].text, strlen(entries[i].text)));
+        if (entries[i].id)
+            set_val(e, entry, "slug", str(e->vm, entries[i].id, strlen(entries[i].id)));
+        push_item(e, out, entry);
+        js_gc_unprotect(e->vm, &entry);
+    }
+    js_gc_unprotect(e->vm, &out);
+    free_headings(entries, count);
+    mdy_free(owned);
+    *result = out;
+    return true;
+}
+
+
+/* ---- publishing to a page ----------------------------------------------------
+ *
+ * `$.emit`'s other tense. `$.emit` writes an output; `$.publish` sends a
+ * message to a page of this set BY NAME, and what happens to it is the
+ * embedder's business — exactly as an emitted output is.
+ *
+ * A page's name is its path with the extension dropped and the separators
+ * turned into dots: `handlers/invoice.mdy` is `handlers.invoice`. A document
+ * may override that with `messageName` in its front matter. It is NOT `name`,
+ * which is already taken twice over — every walked source carries its file's
+ * base name, and a data record commonly declares its own — and reusing it
+ * would let an author's data silently readdress their messages.
+ */
+
+/* The grammar is a file name's, because a subject is one where these end up:
+ * letters, digits, `_`, `.` and `-`, 1–128 of them, no leading or trailing
+ * dot and no `..`. */
+static const char *name_problem(const char *name, char *buf, size_t buf_len) {
+    if (!name || !*name) return "must be a non-empty string";
+    size_t n = strlen(name);
+    /* One rule, so one message: the grammar is a single anchored pattern, and
+     * a name that is too long fails it the same way one with a space does. */
+    int legal = n <= 128;
+    for (size_t i = 0; i < n && legal; i++) {
+        char c = name[i];
+        legal = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+    }
+    if (!legal) {
+        snprintf(buf, buf_len,
+                 "may only contain letters, digits, \"_\", \".\" and \"-\", and must be "
+                 "1\u2013128 characters (got \"%s\")", name);
+        return buf;
+    }
+    if (name[0] == '.' || name[n - 1] == '.') return "must not start or end with \".\"";
+    if (strstr(name, "..")) return "must not contain \"..\"";
+    return NULL;
+}
+
+/* A document's message name, or NULL — most documents are never published to,
+ * and a name is only required of the ones that are. Caller frees. */
+static char *message_name(mdy_engine *e, size_t at) {
+    JsValue record = document_record(e, at);
+    js_gc_protect(e->vm, &record);
+
+    /*
+     * A record carrying an `ext` that is not .mdy/.md is skipped: a set built
+     * from a directory holds raw records too, and a message RENDERS the page
+     * it names, so a record with nothing to run is not an endpoint. It also
+     * stops static/logo.png and static/logo.jpg colliding on `static.logo`.
+     * A set built from a string has no `ext` at all and stays addressable.
+     */
+    char *ext = js_string_utf8(js_object_get(e->vm, record, key(e->vm, "ext")));
+    if (ext) {
+        int runnable = ends_with_ci(ext, ".mdy") || ends_with_ci(ext, ".md");
+        free(ext);
+        if (!runnable) { js_gc_unprotect(e->vm, &record); return NULL; }
+    }
+
+    char *declared = js_string_utf8(js_object_get(e->vm, record, key(e->vm, "messageName")));
+    if (declared && *declared) { js_gc_unprotect(e->vm, &record); return declared; }
+    free(declared);
+
+    char *path = js_string_utf8(js_object_get(e->vm, record, key(e->vm, "path")));
+    js_gc_unprotect(e->vm, &record);
+    if (!path || !*path) { free(path); return NULL; }
+
+    /* Drop the extension — the last dot, but only in the last segment. */
+    char *slash = strrchr(path, '/');
+    char *dot = strrchr(slash ? slash : path, '.');
+    if (dot && dot != path) *dot = '\0';
+    for (char *p = path; *p; p++) if (*p == '/') *p = '.';
+    if (!*path) { free(path); return NULL; }
+    return path;
+}
+
+static bool publish_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                           int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    *result = js_null();
+
+    char *name = argc > 0 ? js_string_utf8(args[0]) : NULL;
+    char why[512];
+    const char *problem = name_problem(name, why, sizeof why);
+    if (problem) {
+        char msg[768];
+        snprintf(msg, sizeof msg, "mdy: publish: a message name %s", problem);
+        free(name);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+
+    /* Which documents answer to it. Deciding that the name means a page of
+     * this set is the whole of core's job here. */
+    size_t found = 0, first = 0;
+    char others[512];
+    size_t used = 0;
+    others[0] = '\0';
+    for (size_t i = 0; i < e->count; i++) {
+        char *have = message_name(e, i);
+        if (have && strcmp(have, name) == 0) {
+            if (found == 0) first = i;
+            found++;
+            char *path = js_string_utf8(
+                js_object_get(e->vm, document_record(e, i), key(e->vm, "path")));
+            if (path && used + strlen(path) + 3 < sizeof others)
+                used += (size_t)snprintf(others + used, sizeof others - used,
+                                         "%s%s", used ? ", " : "", path);
+            free(path);
+        }
+        free(have);
+    }
+
+    if (found == 0) {
+        char msg[512];
+        snprintf(msg, sizeof msg,
+                 "mdy: publish: no document is named \"%s\" (a page's name is its path "
+                 "without the extension, \"/\" written as \".\")", name);
+        free(name);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    if (found > 1) {
+        char msg[768];
+        snprintf(msg, sizeof msg,
+                 "mdy: publish: \"%s\" is ambiguous \u2014 %zu documents share it (%s); "
+                 "give one of them a messageName", name, found, others);
+        free(name);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+
+    if (e->on_publish) {
+        /*
+         * The data arrives ALREADY serialised, by the guest's own
+         * JSON.stringify — see the `$` wrapper. That is deliberate: a second
+         * serialiser written here would need its own number formatting, and
+         * getting that subtly wrong is exactly the kind of difference that
+         * shows up as a last digit in a page and nowhere else.
+         */
+        char *json = argc > 1 ? js_string_utf8(args[1]) : NULL;
+        e->on_publish(e->on_publish_ud, name, json ? json : "{}", first);
+        free(json);
+    }
+    free(name);
+    return true;
+}
+
 static void register_natives(mdy_engine *e) {
     register_one(e, "__native", refuse);
     register_one(e, "__compose", compose_native);
@@ -2460,6 +3114,13 @@ static void register_natives(mdy_engine *e) {
     register_one(e, "__importRender", import_render_native);
     register_one(e, "__importFind", import_find_native);
     register_one(e, "__importFindOne", import_find_one_native);
+    register_one(e, "__parse", parse_native);
+    register_one(e, "__markdown", markdown_native);
+    register_one(e, "__node", node_native);
+    register_one(e, "__html", html_native);
+    register_one(e, "__table", table_native);
+    register_one(e, "__toc", toc_native);
+    register_one(e, "__publish", publish_native);
 }
 
 /*
@@ -2572,13 +3233,17 @@ static char *wrap(const char *statements) {
         "  render: (t, d) => __render(t, d),\n"
         "  text: (t, d) => __text(t, d),\n"
         "  emit: (p, c) => __emit(p, c),\n"
-        "  publish: (n, d) => __native('publish', n, d),\n"
-        "  parse: (s) => __native('parse', s),\n"
-        "  markdown: (s) => __native('markdown', s),\n"
-        "  node: (t) => __native('node', t),\n"
-        "  html: (v) => __native('html', v),\n"
-        "  table: (r, a) => __native('table', r, a),\n"
-        "  toc: (t) => __native('toc', t),\n"
+        "  publish: (n, d) => __publish(n, JSON.stringify(d === undefined ? {} : d)),\n"
+        /* The one native that is a DEPENDENCY rather than a port: resizing
+         * needs JPEG and PNG codecs. It refuses by name so a document that
+         * asks gets told, rather than a page quietly missing a picture. */
+        "  resize: (r, o) => __native('resize', r, o),\n"
+        "  parse: (s) => __parse(s),\n"
+        "  markdown: (s) => __markdown(s),\n"
+        "  node: (t) => __node(t),\n"
+        "  html: (v) => __html(v),\n"
+        "  table: (r, a) => __table(r, a),\n"
+        "  toc: (t) => __toc(t),\n"
         "  tokenize: (s) => __tokenize(s),\n"
         "  rfc822: (d) => __rfc822(d),\n"
         "  __importRender: (s, t, c) => __importRender(s, t, c),\n"
@@ -2865,6 +3530,10 @@ static mdy_doc *render_tree_out(mdy_engine *e, size_t index, JsValue request,
         splice_tree(e, tree, mdy_root(tree));
         out = tree;
     }
+
+    /* Last of all, on the finished tree: a contents list names every heading
+     * the document ended up with, including ones written below it. */
+    if (out) fill_toc(e, out);
 
 done:
 #undef FAIL

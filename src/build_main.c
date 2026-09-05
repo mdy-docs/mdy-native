@@ -20,7 +20,7 @@
 #include "engine.h"
 #include "fsx.h"
 
-typedef struct { const char *out; int count; int failed; } Sink;
+typedef struct { const char *out; int count; int failed; int messages; } Sink;
 
 static void write_page(void *ud, const char *path, const char *content) {
     Sink *s = ud;
@@ -30,6 +30,21 @@ static void write_page(void *ud, const char *path, const char *content) {
         return;
     }
     s->count++;
+}
+
+/*
+ * A published message. `$.emit` writes a file; `$.publish` addresses a page,
+ * and where the message GOES is the embedder's business — a broker, a queue,
+ * a log. This embedder builds a site, so it has nowhere to send one and says
+ * so rather than dropping it silently.
+ */
+static void note_message(void *ud, const char *name, const char *data_json,
+                         size_t doc_index) {
+    Sink *s = ud;
+    (void)doc_index;
+    if (s->messages < 5)
+        fprintf(stderr, "[publish] %s %s\n", name, data_json);
+    s->messages++;
 }
 
 /* Every file under `<root>/static/`, copied to the output root. */
@@ -86,8 +101,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    Sink sink = { out, 0, 0 };
+    Sink sink = { out, 0, 0, 0 };
     mdy_engine_on_emit(e, write_page, &sink);
+    mdy_engine_on_publish(e, note_message, &sink);
 
     char *html = mdy_engine_render(e, (size_t)at, err, sizeof err);
     if (!html) {
@@ -103,8 +119,12 @@ int main(int argc, char **argv) {
     size_t roots = mdy_engine_root_count(e);
     for (size_t i = 0; i < roots; i++) assets += copy_static(mdy_engine_root_at(e, i), out);
     mdy_engine_free(e);
-    if (!quiet)
+    if (!quiet) {
         printf("built %d page(s)%s -> %s\n", sink.count,
                assets ? " and copied static/" : "", out);
+        if (sink.messages)
+            printf("%d message(s) not sent - this embedder builds a site, "
+                   "it has no broker\n", sink.messages);
+    }
     return sink.failed ? 1 : 0;
 }
