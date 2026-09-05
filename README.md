@@ -632,6 +632,34 @@ construct a case that tells them apart. The sort stays because mdy-docs sorts,
 and the `_id` to index map earns its place regardless: resolving a hit back to
 its document is what `$.render({ … })` needs.
 
+### Composition
+
+`$.render` does not return HTML, or a tree, or text. It returns a **token** —
+`U+E000 <id> U+E001`, a few private-use characters standing for a tree the host
+has parked — and the token travels through the document's own code like any
+other string: into a variable, a template literal, an attribute. The tree goes
+back in once the text around it has been parsed.
+
+That is why a render needs no indentation argument. The parser already knows
+which element is open where the token landed, so there is no column for the
+caller to compute.
+
+Splicing has two halves, and the difference matters:
+
+- a paragraph holding **nothing but tokens** is REPLACED by what they hold —
+  a render on a line of its own is that document, not a paragraph wrapping it;
+- a token **inside a sentence** gives up its blocks instead, as far down as the
+  blocks go, because a block cannot sit inside a sentence.
+
+`$.emit(path, content)` is the string-shaped half: tokens in the content become
+the HTML they stood for, because a file is a string and that is the shape it
+can hold. Where an emit goes is `mdy_engine_on_emit`'s business — a build
+writes a file, a server holds it, a test collects it, and mdy has no opinion.
+
+A nested render's failure is passed through rather than wrapped again. mdy-docs
+wraps at every level, so a cycle reports "document 0 failed:" thirty times over
+and the reason falls off the end.
+
 ### transform: the tree through lamassu and back
 
 `transform((tree) => …)` is the one place a document's own code sees its tree,

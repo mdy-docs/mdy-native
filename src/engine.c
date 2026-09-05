@@ -20,6 +20,9 @@
 #include "mdyscript.h"
 #include "toolkit.h"
 
+/* A tree a `$.render` parked, and the id of the token standing for it. */
+typedef struct { char id[24]; mdy_doc *doc; mdy_node *tree; } Held;
+
 /* One document of an open set. Its TEXT is here; its DATA is in nisaba. */
 typedef struct {
     mdy_chunk chunk;      /* the document's own text */
@@ -43,6 +46,14 @@ struct mdy_engine {
     size_t count;
     int handle;                 /* nisaba's, from nis_open */
     mdy_documents *source_docs;
+
+    /* Trees a `$.render` parked, and the tokens standing for them. */
+    Held *held;
+    size_t held_count, held_cap;
+    size_t next_token;
+    int depth;                  /* renders inside renders */
+    void (*on_emit)(void *ud, const char *path, const char *content);
+    void *on_emit_ud;
     /* `_id` to index, in insertion order, so a hit maps back to its document. */
     uint8_t (*ids)[12];
 };
@@ -442,6 +453,432 @@ static JsValue binjson_to_js(mdy_engine *e, const uint8_t *bytes, size_t len, si
 }
 
 
+
+/* ---- composition -------------------------------------------------------------
+ *
+ * `$.render` does not return HTML, or a tree, or text. It returns a TOKEN — a
+ * few private-use characters standing for a tree the host has parked — and the
+ * token travels through the document's own code like any other string, into a
+ * variable, a template literal, an attribute. The tree goes back in once the
+ * text around it has been parsed.
+ *
+ * That is what makes `$.render` need no indentation argument: the parser
+ * already knows which element is open where the token landed, so there is no
+ * column for the caller to compute.
+ *
+ *   U+E000 <id> U+E001
+ *
+ * The id is base36 so a counter and a content-derived identity are both
+ * covered by one pattern — three regexes in compose.js have to agree about
+ * what an id looks like, and once they did not.
+ */
+#define TOKEN_OPEN  "\xee\x80\x80"      /* U+E000 as UTF-8 */
+#define TOKEN_CLOSE "\xee\x80\x81"      /* U+E001 */
+
+/* A token's id at `s`, or 0. Writes the id and how many bytes it spanned. */
+static size_t token_at(const char *s, size_t len, char *id, size_t id_cap) {
+    if (len < 5 || memcmp(s, TOKEN_OPEN, 3) != 0) return 0;
+    size_t i = 3;
+    size_t n = 0;
+    while (i < len && n + 1 < id_cap) {
+        char c = s[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')) { id[n++] = c; i++; continue; }
+        break;
+    }
+    id[n] = '\0';
+    if (n == 0) return 0;
+    if (i + 3 > len || memcmp(s + i, TOKEN_CLOSE, 3) != 0) return 0;
+    return i + 3;
+}
+
+static Held *held_find(mdy_engine *e, const char *id) {
+    for (size_t i = 0; i < e->held_count; i++)
+        if (strcmp(e->held[i].id, id) == 0) return &e->held[i];
+    return NULL;
+}
+
+/*
+ * Park a tree and hand back the token that stands for it.
+ *
+ * Nothing is reclaimed within a render: a token can be written into a string,
+ * kept in a variable, dropped, or used twice, and nothing here gets to decide
+ * when the last of those happened.
+ */
+static char *hold_tree(mdy_engine *e, mdy_doc *doc, mdy_node *tree) {
+    if (e->held_count == e->held_cap) {
+        size_t want = e->held_cap ? e->held_cap * 2 : 8;
+        Held *grown = realloc(e->held, want * sizeof *grown);
+        if (!grown) return NULL;
+        e->held = grown;
+        e->held_cap = want;
+    }
+    Held *h = &e->held[e->held_count++];
+    snprintf(h->id, sizeof h->id, "%zu", e->next_token++);
+    h->doc = doc;
+    h->tree = tree;
+
+    size_t n = strlen(TOKEN_OPEN) + strlen(h->id) + strlen(TOKEN_CLOSE) + 1;
+    char *token = malloc(n);
+    if (token) snprintf(token, n, "%s%s%s", TOKEN_OPEN, h->id, TOKEN_CLOSE);
+    return token;
+}
+
+static void release_held(mdy_engine *e) {
+    for (size_t i = 0; i < e->held_count; i++) mdy_free(e->held[i].doc);
+    free(e->held);
+    e->held = NULL;
+    e->held_count = e->held_cap = 0;
+}
+
+/* Whitespace, and nothing else. */
+static int only_space(const char *s, size_t len) {
+    for (size_t i = 0; i < len; i++)
+        if (s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r') return 0;
+    return 1;
+}
+
+/* `^(?:\s*TOKEN)+\s*$` — a run that is nothing but tokens and space. */
+static int only_tokens(const char *s, size_t len) {
+    size_t i = 0;
+    int found = 0;
+    for (;;) {
+        while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++;
+        if (i >= len) return found;
+        char id[24];
+        size_t used = token_at(s + i, len - i, id, sizeof id);
+        if (!used) return 0;
+        i += used;
+        found = 1;
+    }
+}
+
+/* Elements that hold a line of their own, and so cannot hold one of somebody
+ * else's — the ones a nested render is likely to produce at its top level. */
+static int is_block_tag(const char *tag) {
+    static const char *const BLOCK[] = { "p", "div", "section", "article", "main", "header", "footer" };
+    for (size_t i = 0; i < sizeof BLOCK / sizeof BLOCK[0]; i++)
+        if (strcmp(BLOCK[i], tag) == 0) return 1;
+    return 0;
+}
+
+/*
+ * Block wrappers off, phrasing content out. A block cannot sit inside a
+ * sentence, so it gives up its wrapper and lends its content instead — as far
+ * down as the blocks go, since unwrapping a <div> only to find a <p> under it
+ * has solved nothing.
+ */
+static void unwrap_into(mdy_node *dest, mdy_node *source) {
+    for (mdy_node *c = source->first; c;) {
+        mdy_node *next = c->next;
+        c->next = NULL;
+        if (c->type == MDY_ELEMENT && is_block_tag(c->tag)) unwrap_into(dest, c);
+        else if (c->type == MDY_TEXT && only_space(c->text ? c->text : "", c->text ? strlen(c->text) : 0)) ;
+        else mdy_append(dest, c);
+        c = next;
+    }
+}
+
+/* What a held tree contributes where a BLOCK was expected: a root lends its
+ * children, anything else stands for itself. */
+static void block_content(mdy_node *dest, mdy_node *tree) {
+    if (tree->type == MDY_ROOT) {
+        for (mdy_node *c = tree->first; c;) {
+            mdy_node *next = c->next;
+            c->next = NULL;
+            mdy_append(dest, c);
+            c = next;
+        }
+    } else {
+        mdy_append(dest, tree);
+    }
+}
+
+/*
+ * Tokens in a run of TEXT, as the inline content they become. Anything that is
+ * not a token stays the text it was.
+ */
+static void inline_content(mdy_engine *e, mdy_doc *doc, mdy_node *dest,
+                           const char *s, size_t len) {
+    size_t i = 0, last = 0;
+    while (i < len) {
+        char id[24];
+        size_t used = token_at(s + i, len - i, id, sizeof id);
+        if (!used) { i++; continue; }
+        if (i > last) mdy_append(dest, mdy_new_text(doc, s + last, i - last));
+        Held *h = held_find(e, id);
+        if (h && h->tree) {
+            mdy_node *holder = mdy_new_element(doc, "span", 4);
+            block_content(holder, h->tree);
+            unwrap_into(dest, holder);
+        } else {
+            mdy_append(dest, mdy_new_text(doc, s + i, used));
+        }
+        i += used;
+        last = i;
+    }
+    if (last < len) mdy_append(dest, mdy_new_text(doc, s + last, len - last));
+}
+
+/* The text of a node that is a `<p>` holding one text child, or a text node —
+ * which is what `onlyTokens` asks about. */
+static const char *sole_text(const mdy_node *n, size_t *len) {
+    if (n->type == MDY_TEXT) { *len = n->text ? strlen(n->text) : 0; return n->text; }
+    if (n->type == MDY_ELEMENT && strcmp(n->tag, "p") == 0 && n->first &&
+        n->first == n->last && n->first->type == MDY_TEXT) {
+        *len = n->first->text ? strlen(n->first->text) : 0;
+        return n->first->text;
+    }
+    return NULL;
+}
+
+/*
+ * Put the held trees back where their tokens are.
+ *
+ * A paragraph holding nothing but tokens is REPLACED by what they hold — a
+ * render on a line of its own is that document, not a paragraph wrapping it.
+ * A token inside a sentence gives up its blocks instead.
+ */
+static void splice_tree(mdy_engine *e, mdy_doc *doc, mdy_node *parent) {
+    mdy_node *child = parent->first;
+    parent->first = parent->last = NULL;
+
+    while (child) {
+        mdy_node *next = child->next;
+        child->next = NULL;
+
+        size_t len = 0;
+        const char *text = sole_text(child, &len);
+
+        if (text && only_tokens(text, len)) {
+            size_t i = 0;
+            int filled = 0;
+            while (i < len) {
+                char id[24];
+                size_t used = token_at(text + i, len - i, id, sizeof id);
+                if (!used) { i++; continue; }
+                Held *h = held_find(e, id);
+                if (h && h->tree) { block_content(parent, h->tree); filled = 1; }
+                i += used;
+            }
+            if (filled) { child = next; continue; }
+        }
+
+        if (child->type == MDY_TEXT && child->text && strstr(child->text, TOKEN_OPEN)) {
+            inline_content(e, doc, parent, child->text, strlen(child->text));
+            child = next;
+            continue;
+        }
+
+        if (child->first) splice_tree(e, doc, child);
+        mdy_append(parent, child);
+        child = next;
+    }
+}
+
+/*
+ * A string holding tokens, as HTML — the string-shaped half of composition.
+ * `$.emit(url, $.render(page))` writes a page because a file is a string and
+ * that is the shape it can hold.
+ */
+static char *fill_tokens(mdy_engine *e, const char *s, size_t len) {
+    size_t cap = len + 256, out = 0;
+    char *result = malloc(cap);
+    if (!result) return NULL;
+    result[0] = '\0';
+
+    size_t i = 0, last = 0;
+    while (i < len) {
+        char id[24];
+        size_t used = token_at(s + i, len - i, id, sizeof id);
+        if (!used) { i++; continue; }
+
+        Held *h = held_find(e, id);
+        char *html = h && h->tree ? mdy_to_html(h->tree, NULL) : NULL;
+        size_t plain = i - last;
+        size_t add = plain + (html ? strlen(html) : 0);
+        if (out + add + 1 > cap) {
+            while (out + add + 1 > cap) cap *= 2;
+            char *grown = realloc(result, cap);
+            if (!grown) { free(html); free(result); return NULL; }
+            result = grown;
+        }
+        memcpy(result + out, s + last, plain);
+        out += plain;
+        if (html) { memcpy(result + out, html, strlen(html)); out += strlen(html); free(html); }
+        result[out] = '\0';
+        i += used;
+        last = i;
+    }
+
+    size_t tail = len - last;
+    if (out + tail + 1 > cap) {
+        char *grown = realloc(result, out + tail + 1);
+        if (!grown) { free(result); return NULL; }
+        result = grown;
+    }
+    memcpy(result + out, s + last, tail);
+    out += tail;
+    result[out] = '\0';
+    return result;
+}
+
+
+/* ---- rendering, and rendering from inside a render --------------------------- */
+
+static int index_of_id(mdy_engine *e, const char *hex);
+static JsValue run_query(mdy_engine *e, JsValue query, int one);
+
+/* A render produces a TREE; HTML is what the outermost caller asks for at the
+ * end. That is the whole reason `$.render` can return a token. */
+/* `req` is what the caller is answering with — `$.render(target, data)`'s
+ * second argument, and an empty object for a render nobody asked a question
+ * of. MDY neither reads it nor cares what shape it is. */
+static mdy_doc *render_tree(mdy_engine *e, size_t index, JsValue req,
+                            char *error, size_t error_len);
+
+/*
+ * `$.render(target, data)` — the target resolved, rendered, parked, and a
+ * token handed back.
+ *
+ * A target is an index, or a query, or a document a `$.find` already returned
+ * (which carries its own `_id`). All three end at a document index, which is
+ * what the `_id` to index map is for.
+ */
+static int resolve_target(mdy_engine *e, JsValue target) {
+    if (js_is_number(target)) {
+        double at = js_get_number(target);
+        return (at >= 0 && at < (double)e->count) ? (int)at : -1;
+    }
+    if (!js_is_object(target)) return -1;
+
+    /* A document from `$.find` carries the id it was inserted with. */
+    char *id = js_string_utf8(js_object_get(e->vm, target, key(e->vm, "_id")));
+    if (id) {
+        int at = index_of_id(e, id);
+        free(id);
+        if (at >= 0) return at;
+    }
+
+    JsValue hit = run_query(e, target, 1);
+    if (!js_is_object(hit)) return -1;
+    char *hit_id = js_string_utf8(js_object_get(e->vm, hit, key(e->vm, "_id")));
+    if (!hit_id) return -1;
+    int at = index_of_id(e, hit_id);
+    free(hit_id);
+    return at;
+}
+
+static bool render_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                          int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    int at = argc > 0 ? resolve_target(e, args[0]) : -1;
+    if (at < 0) {
+        const char *msg = "mdy-engine: $.render found no such document";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+
+    char err[256];
+    mdy_doc *doc = render_tree(e, (size_t)at,
+                               argc > 1 ? args[1] : js_undefined(), err, sizeof err);
+    if (!doc) {
+        /*
+         * A nested render's failure is passed through rather than wrapped
+         * again. mdy-docs wraps at every level, so a cycle reports
+         * "document 0 failed: document 0 failed: …" thirty times over and the
+         * reason falls off the end. The first message is the one that says
+         * something.
+         */
+        char msg[320];
+        if (strncmp(err, "mdy-engine:", 11) == 0)
+            snprintf(msg, sizeof msg, "%s", err);
+        else
+            snprintf(msg, sizeof msg, "mdy-engine: document %d failed: %s", at, err);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+
+    char *token = hold_tree(e, doc, mdy_root(doc));
+    if (!token) { *result = js_undefined(); return false; }
+    *result = str(e->vm, token, strlen(token));
+    free(token);
+    return true;
+}
+
+/* `$.text(target)` — the same render, as the text it holds rather than a
+ * token. What a document's own code wrote, with no markup around it. */
+static void collect_text_into(const mdy_node *n, char **out, size_t *len, size_t *cap) {
+    if (n->type == MDY_TEXT && n->text) {
+        size_t add = strlen(n->text);
+        if (*len + add + 1 > *cap) {
+            while (*len + add + 1 > *cap) *cap = *cap ? *cap * 2 : 256;
+            char *grown = realloc(*out, *cap);
+            if (!grown) return;
+            *out = grown;
+        }
+        memcpy(*out + *len, n->text, add);
+        *len += add;
+        (*out)[*len] = '\0';
+    }
+    if (n->type == MDY_COMMENT || n->type == MDY_DOCTYPE) return;
+    for (const mdy_node *c = n->first; c; c = c->next) collect_text_into(c, out, len, cap);
+}
+
+static bool text_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                        int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    int at = argc > 0 ? resolve_target(e, args[0]) : -1;
+    if (at < 0) {
+        const char *msg = "mdy-engine: $.text found no such document";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    char err[256];
+    mdy_doc *doc = render_tree(e, (size_t)at,
+                               argc > 1 ? args[1] : js_undefined(), err, sizeof err);
+    if (!doc) {
+        char msg[320];
+        if (strncmp(err, "mdy-engine:", 11) == 0) snprintf(msg, sizeof msg, "%s", err);
+        else snprintf(msg, sizeof msg, "mdy-engine: document %d failed: %s", at, err);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    char *text = NULL;
+    size_t len = 0, cap = 0;
+    collect_text_into(mdy_root(doc), &text, &len, &cap);
+    *result = str(e->vm, text ? text : "", len);
+    free(text);
+    /* The tree is held so it outlives this call, like any other render's. */
+    char *token = hold_tree(e, doc, mdy_root(doc));
+    free(token);
+    return true;
+}
+
+/*
+ * `$.emit(path, content)` — a named output. Tokens in the content become the
+ * HTML they hold, because a file is a string and that is the shape it can
+ * hold.
+ */
+static bool emit_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                        int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    if (argc < 2) { *result = js_null(); return true; }
+    char *path = js_string_utf8(args[0]);
+    char *content = js_string_utf8(args[1]);
+    if (path && content) {
+        char *filled = fill_tokens(e, content, strlen(content));
+        if (filled && e->on_emit) e->on_emit(e->on_emit_ud, path, filled);
+        free(filled);
+    }
+    free(path);
+    free(content);
+    *result = js_null();
+    return true;
+}
+
 /* ---- opening a set ---------------------------------------------------------- */
 
 /* nisaba keys its primary tree on OID bytes and needs a file behind it; a set
@@ -571,6 +1008,14 @@ int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
 }
 
 size_t mdy_engine_count(mdy_engine *e) { return e ? e->count : 0; }
+
+void mdy_engine_on_emit(mdy_engine *e,
+                        void (*fn)(void *ud, const char *path, const char *content),
+                        void *ud) {
+    if (!e) return;
+    e->on_emit = fn;
+    e->on_emit_ud = ud;
+}
 
 /* ---- querying ---------------------------------------------------------------
  *
@@ -736,6 +1181,9 @@ static bool compose_native(JsContext *ctx, JsValue this_val, const JsValue *args
         *result = str(e->vm, msg, strlen(msg));
         return false;
     }
+    /* Composed before the transforms see it: a transform works on the
+     * document's FINISHED tree, renders and all. */
+    splice_tree(e, tree, mdy_root(tree));
     /* The document owns the tree until the render finishes with it. */
     mdy_free(e->tree_owner);
     e->tree_owner = tree;
@@ -757,6 +1205,9 @@ static void register_natives(mdy_engine *e) {
     register_one(e, "__find", find_native);
     register_one(e, "__findOne", find_one_native);
     register_one(e, "__data", data_native);
+    register_one(e, "__render", render_native);
+    register_one(e, "__text", text_native);
+    register_one(e, "__emit", emit_native);
 }
 
 /*
@@ -818,9 +1269,9 @@ static char *wrap(const char *statements) {
         "  find: (q) => __find(q === undefined ? {} : q),\n"
         "  findOne: (q) => __findOne(q === undefined ? {} : q),\n"
         "  withTag: (t) => __find({ tags: String(t).toLowerCase() }),\n"
-        "  render: (t, d) => __native('render', t, d),\n"
-        "  text: (t, d) => __native('text', t, d),\n"
-        "  emit: (p, c) => __native('emit', p, c),\n"
+        "  render: (t, d) => __render(t, d),\n"
+        "  text: (t, d) => __text(t, d),\n"
+        "  emit: (p, c) => __emit(p, c),\n"
         "  publish: (n, d) => __native('publish', n, d),\n"
         "  parse: (s) => __native('parse', s),\n"
         "  markdown: (s) => __native('markdown', s),\n"
@@ -921,10 +1372,19 @@ static mdy_doc *parse_lines(JsValue out, mdy_engine *e) {
     return tree;
 }
 
-char *mdy_engine_render(mdy_engine *e, size_t index, char *error, size_t error_len) {
+static mdy_doc *render_tree(mdy_engine *e, size_t index, JsValue request,
+                            char *error, size_t error_len) {
     if (error && error_len) error[0] = '\0';
-    char *html = NULL;
+    mdy_doc *out = NULL;
     mdy_script *script = NULL;
+
+    /* A render inside a render inside a render is a cycle somebody wrote. */
+    if (e->depth > 32) {
+        if (error && error_len)
+            snprintf(error, error_len, "mdy-engine: render depth exceeded (cyclic $.render?)");
+        return NULL;
+    }
+    e->depth++;
 
 #define FAIL(...) do { if (error && error_len) snprintf(error, error_len, __VA_ARGS__); goto done; } while (0)
 
@@ -963,7 +1423,7 @@ char *mdy_engine_render(mdy_engine *e, size_t index, char *error, size_t error_l
     js_gc_protect(e->vm, &callable);
 
     /* the request, the response, and `$` */
-    JsValue req = js_object_new(e->ctx);
+    JsValue req = js_is_object(request) ? request : js_object_new(e->ctx);
     js_gc_protect(e->vm, &req);
     JsValue res = js_object_new(e->ctx);
     js_gc_protect(e->vm, &res);
@@ -1009,24 +1469,53 @@ char *mdy_engine_render(mdy_engine *e, size_t index, char *error, size_t error_l
      */
     JsValue transformed = js_object_get(e->vm, result, key(e->vm, "tree"));
     if (js_is_object(transformed)) {
+        /* Already composed: `$.compose` spliced it before the transforms saw
+         * it, which is what let a transform work on the finished tree. */
         mdy_doc *doc = mdy_doc_new();
         if (!doc) FAIL("out of memory");
         mdy_node *root = js_to_tree(e, doc, transformed);
-        html = mdy_to_html(root ? root : mdy_root(doc), NULL);
-        mdy_free(doc);
+        /*
+         * `mdy_doc` owns its root, so the tree that came back is hung under
+         * it: a root lends its children, and a transform that returned a
+         * single element becomes that document's one child. Which is what
+         * `blockContent` does with a held tree, for the same reason.
+         */
+        mdy_node *into = (mdy_node *)mdy_root(doc);
+        if (root && root->type == MDY_ROOT) {
+            for (mdy_node *c = root->first; c;) {
+                mdy_node *next = c->next;
+                c->next = NULL;
+                mdy_append(into, c);
+                c = next;
+            }
+        } else if (root) {
+            mdy_append(into, root);
+        }
+        out = doc;
     } else {
-        JsValue out = js_object_get(e->vm, result, key(e->vm, "out"));
-        if (!js_is_array(out)) FAIL("the document did not produce its lines");
-        mdy_doc *tree = parse_lines(out, e);
+        JsValue lines = js_object_get(e->vm, result, key(e->vm, "out"));
+        if (!js_is_array(lines)) FAIL("the document did not produce its lines");
+        mdy_doc *tree = parse_lines(lines, e);
         if (!tree) FAIL("the produced lines did not parse");
-        html = mdy_to_html(mdy_root(tree), NULL);
-        mdy_free(tree);
+        /* The held trees go back where their tokens are. */
+        splice_tree(e, tree, mdy_root(tree));
+        out = tree;
     }
 
 done:
 #undef FAIL
-    mdy_free(e->tree_owner);
-    e->tree_owner = NULL;
+    e->depth--;
     mdy_script_free(script);
+    return out;
+}
+
+char *mdy_engine_render(mdy_engine *e, size_t index, char *error, size_t error_len) {
+    if (error && error_len) error[0] = '\0';
+    mdy_doc *doc = render_tree(e, index, js_undefined(), error, error_len);
+    if (!doc) { release_held(e); return NULL; }
+    char *html = mdy_to_html(mdy_root(doc), NULL);
+    mdy_free(doc);
+    /* Nothing a render parked outlives the render that asked for it. */
+    release_held(e);
     return html;
 }

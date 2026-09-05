@@ -14,6 +14,16 @@
 
 static int failures;
 
+/* Where an `$.emit` lands, for the check below. */
+static char last_emit_path[256];
+static char last_emit_content[4096];
+
+static void collect_emit(void *ud, const char *path, const char *content) {
+    (void)ud;
+    snprintf(last_emit_path, sizeof last_emit_path, "%s", path);
+    snprintf(last_emit_content, sizeof last_emit_content, "%s", content);
+}
+
 static void check(const char *what, const char *source, const char *expected) {
     mdy_engine *e = mdy_engine_new();
     char err[256];
@@ -186,6 +196,133 @@ int main(void) {
           "---\n+++\nrole: r\n+++\nthe secret body\n",
           "<h1 id=\"clean\">clean</h1>");
 
+    printf("--- engine: composition ---\n");
+
+    /*
+     * `$.render` returns a TOKEN, not HTML — a few private-use characters
+     * standing for a tree the host parked. The token travels through the
+     * document's own code like any other string, and the tree goes back in
+     * once the text around it has been parsed. That is why a render needs no
+     * indentation argument: the parser already knows which element is open
+     * where the token landed.
+     */
+    check("a render on a line of its own becomes that document",
+          "{{ $.render(1) }}\n---\n= Card\n",
+          "<h1 id=\"card\">Card</h1>");
+
+    check("…and is not wrapped in a paragraph",
+          "before\n\n{{ $.render(1) }}\n\nafter\n---\n= Card\n",
+          "<p>before</p><h1 id=\"card\">Card</h1><p>after</p>");
+
+    /* A block cannot sit inside a sentence, so it gives up its wrapper and
+     * lends its content instead. */
+    check("a render inside a sentence gives up its blocks",
+          "say {{ $.render(1) }} now\n---\ninner\n",
+          "<p>say inner now</p>");
+
+    check("a render by query",
+          "{{ $.render({ role: 'card' }) }}\n---\n+++\nrole: card\n+++\n= Found\n",
+          "<h1 id=\"found\">Found</h1>");
+
+    check("a render of a document a find returned",
+          "% const c = $.findOne({ role: 'card' })\n{{ $.render(c) }}\n"
+          "---\n+++\nrole: card\n+++\n= By reference\n",
+          "<h1 id=\"by-reference\">By reference</h1>");
+
+    check("several renders in a loop",
+          "% for (const c of $.find({ role: 'city' })) {\n"
+          "{{ $.render(c) }}\n"
+          "% }\n"
+          "---\n+++\nrole: city\n+++\n= Uruk\n"
+          "---\n+++\nrole: city\n+++\n= Babylon\n",
+          "<h1 id=\"uruk\">Uruk</h1><h1 id=\"babylon\">Babylon</h1>");
+
+    check("a render nested two deep",
+          "{{ $.render(1) }}\n---\nouter {{ $.render(2) }}\n---\ninner\n",
+          "<p>outer inner</p>");
+
+    check("$.text gives what a document wrote, without the markup",
+          "= {{ $.text(1) }}\n---\n**bold** and //em//\n",
+          "<h1 id=\"bold-and-em\">bold and em</h1>");
+
+    check("a token in a transformed document is still composed",
+          "%% transform((tree) => {\n"
+          "  visit(tree, 'h1', (node) => { node.tagName = 'h2'; });\n"
+          "})\n"
+          "{{ $.render(1) }}\n---\n= Card\n",
+          "<h2 id=\"card\">Card</h2>");
+
+    /* `$.render(target, data)` hands the target its `req`. */
+    check("a render passes its data as req",
+          "{{ $.render(1, { who: 'Uruk' }) }}\n---\n= {{ req.who }}\n",
+          "<h1 id=\"uruk\">Uruk</h1>");
+
+    check("…and the same document answers differently each time",
+          "% for (const who of ['Uruk', 'Babylon']) {\n"
+          "{{ $.render(1, { who }) }}\n"
+          "% }\n---\n= {{ req.who }}\n",
+          "<h1 id=\"uruk\">Uruk</h1><h1 id=\"babylon\">Babylon</h1>");
+
+    check("a document with no request sees an empty one",
+          "= {{ Object.keys(req).length }}", "<h1 id=\"0\">0</h1>");
+
+    refuses("a render that cycles", "{{ $.render(0) }}", "render depth exceeded");
+
+    /*
+     * The shape a site actually has: a loop over queried documents, each
+     * rendered through a shared layout with its own data, each emitted to its
+     * own path — and the layout transforming its own tree on the way.
+     */
+    {
+        last_emit_path[0] = last_emit_content[0] = '\0';
+        mdy_engine *e = mdy_engine_new();
+        mdy_engine_on_emit(e, collect_emit, NULL);
+        char err[256];
+        const char *source =
+            "% for (const c of $.find({ role: 'city' })) {\n"
+            "%   $.emit(c.slug + '/index.html', $.render({ role: 'layout' }, { who: c.who }))\n"
+            "% }\n"
+            "---\n+++\nrole: layout\n+++\n"
+            "%% transform((tree) => { visit(tree, 'h1', (n) => { n.properties.className = ['title']; }); })\n"
+            "= {{ req.who }}\n"
+            "---\n+++\nrole: city\nwho: Uruk\nslug: uruk\n+++\n"
+            "---\n+++\nrole: city\nwho: Babylon\nslug: babylon\n+++\n";
+        int ok = mdy_engine_open(e, source, strlen(source), err, sizeof err) == 0;
+        if (ok) { char *html = mdy_engine_render(e, 0, err, sizeof err); ok = html != NULL; free(html); }
+        ok = ok && strcmp(last_emit_path, "babylon/index.html") == 0 &&
+             /* `id` then `class`: the parser sets the id, the transform adds
+              * the class, and that is the order. Taken from what
+              * `node bin/mdy.js build` writes for this exact site. */
+             strcmp(last_emit_content, "<h1 id=\"babylon\" class=\"title\">Babylon</h1>") == 0;
+        printf("  %s  a query, a shared layout, a transform and an emit each\n", ok ? "ok  " : "FAIL");
+        if (!ok) { printf("      last path %s\n      last content %s\n      err %s\n",
+                          last_emit_path, last_emit_content, err); failures++; }
+        mdy_engine_free(e);
+    }
+
+    printf("--- engine: emit ---\n");
+    {
+        /* A build writes a file, a server holds it, this collects it — mdy
+         * has no opinion on what producing an output means. */
+        last_emit_path[0] = last_emit_content[0] = '\0';
+
+        mdy_engine *e = mdy_engine_new();
+        mdy_engine_on_emit(e, collect_emit, NULL);
+        char err[256];
+        const char *source =
+            "% $.emit('index.html', $.render(1))\n"
+            "---\n= Page\n";
+        if (mdy_engine_open(e, source, strlen(source), err, sizeof err) == 0) {
+            char *html = mdy_engine_render(e, 0, err, sizeof err);
+            free(html);
+        }
+        int ok = strcmp(last_emit_path, "index.html") == 0 &&
+                 strcmp(last_emit_content, "<h1 id=\"page\">Page</h1>") == 0;
+        printf("  %s  a token in emitted content becomes its HTML\n", ok ? "ok  " : "FAIL");
+        if (!ok) { printf("      path %s\n      content %s\n", last_emit_path, last_emit_content); failures++; }
+        mdy_engine_free(e);
+    }
+
     printf("--- engine: transform, the tree through lamassu and back ---\n");
 
     /*
@@ -254,8 +391,10 @@ int main(void) {
             "%% transform(() => 42)\n= x", "transform must return a hast node");
 
     printf("--- engine: what it refuses, loudly ---\n");
-    refuses("a native that is not implemented yet",
-            "{{ $.render({ role: 'card' }) }}", "$.render is not implemented");
+    refuses("a native that is still not implemented",
+            "{{ $.toc() }}", "$.toc is not implemented");
+    refuses("a render of a document that is not there",
+            "{{ $.render({ role: 'nowhere' }) }}", "found no such document");
     refuses("code that does not compile", "% const = \n= x", "did not compile");
     refuses("code that throws", "% throw 'nope'\n= x", "nope");
     {

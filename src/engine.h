@@ -57,6 +57,20 @@ int mdy_engine_open(mdy_engine *engine, const char *source, size_t len,
 size_t mdy_engine_count(mdy_engine *engine);
 
 /*
+ * Where a document's `$.emit(path, content)` goes.
+ *
+ * mdy has no opinion on what producing an output means — a build writes a
+ * file, a server holds it in memory, a test collects it. Tokens in `content`
+ * have already become the HTML they stood for, because a file is a string and
+ * that is the shape it can hold.
+ *
+ * Without one, `$.emit` is a harmless no-op, which is also what mdy-docs does.
+ */
+void mdy_engine_on_emit(mdy_engine *engine,
+                        void (*fn)(void *ud, const char *path, const char *content),
+                        void *ud);
+
+/*
  * Render the document at `index` to HTML. Caller frees.
  *
  * NULL on failure, with a message written into `error` — a compile error from
