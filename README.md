@@ -577,6 +577,44 @@ written `{size: 4}` does not match a document that stored `4.0`.
 `_id` is a fresh ObjectId because nisaba's primary tree is keyed on
 fixed-width OID bytes and refuses anything else.
 
+## The C engine: one document, end to end
+
+`make check-engine` renders a document with **no JavaScript engine but
+lamassu**. QuickJS is not linked into that binary at all — `nm` finds zero of
+its symbols in it.
+
+It is mdy-docs' own three passes (src/mdy.js's file comment), done in C:
+
+```
+  1. the source splits into documents on bare `---`, and each into the YAML
+     at its top and the body below it, with ```data fences pulled out
+                                                   mdydoc.h, mdydata.h
+  2. the body's `%` and `{{ }}` lines compile to one run of statements,
+     which run inside lamassu and return the lines the document produced
+                                                   mdyscript.h, lamassu
+  3. those lines parse to hast — the last change of representation there is
+                                                   mdyast.h
+  …and the tree is written as HTML                 mdyhtml.h
+```
+
+The statements are wrapped as `(async (req, res, $$) => { … })`, so `req` and
+`res` arrive as VALUES and one compiled function serves every render. That is
+the whole reason the script layer produces statements that never mention the
+request.
+
+**`$` refuses, loudly.** Every native is present and throws with its own name
+— `$.render is not implemented in the C engine yet` — because a stub returning
+undefined produces a page quietly missing whatever the document asked for,
+which is the failure this project has been most careful to avoid.
+
+Two gaps in lamassu's API are worth naming, because they are the same small
+addition `js_array_new` was. There is no `js_function_new`, only
+`js_register_native` for globals — so `$` is built in the wrapper source over
+one global native rather than as an object of native function values. And a
+render's positions point at the GENERATED lines rather than the source ones:
+mdy-docs carries a line map from the script layer into the parser and this does
+not yet, which changes no HTML, only where a warning would say it came from.
+
 ## Next
 
 The backend builds. What it does not yet do is *serve*, and the plan's Phase 1c

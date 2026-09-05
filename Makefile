@@ -244,7 +244,7 @@ check-golden: build/mdy-native$(EXE) build/site.js
 	done; \
 	exit $$fail
 
-.PHONY: build native site bench test test-c-parser check-ingest clean
+.PHONY: build native site bench test test-c-parser check-ingest check-engine clean
 
 # A document from text into a nisaba collection, with no JavaScript in it:
 # data fences, YAML, binjson, dc_insert_one, and a query back out. This is the
@@ -257,6 +257,16 @@ build/ingest-test$(EXE): test/ingest.c src/ingest.c src/nis.c $(NIS_SRCS) $(PARS
 
 check-ingest: build/ingest-test$(EXE)
 	@./build/ingest-test$(EXE)
+
+# One document, end to end, with no JavaScript engine but lamassu — the three
+# passes of src/mdy.js done in C. QuickJS is not linked into this binary.
+build/engine-test$(EXE): test/engine.c src/engine.c $(LAM_LIBS) $(PARSE_LIB)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc $(PARSE_INC) test/engine.c src/engine.c \
+	  $(PARSE_LIB) $(LAM_LIBS) -o $@ $(LDLIBS)
+
+check-engine: build/engine-test$(EXE)
+	@./build/engine-test$(EXE)
 # The 713 of mdy-docs' 776 tests that a runtime with no subprocesses, no HTTP
 # server and no WebAssembly can run. See tests-entry.mjs for what is left out
 # and why each one is a property of the runtime rather than a gap in the port.
