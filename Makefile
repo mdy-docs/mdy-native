@@ -260,14 +260,48 @@ check-ingest: build/ingest-test$(EXE)
 
 # One document, end to end, with no JavaScript engine but lamassu — the three
 # passes of src/mdy.js done in C. QuickJS is not linked into this binary.
-build/engine-test$(EXE): test/engine.c src/engine.c src/ingest.c src/nis.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
+build/engine-test$(EXE): test/engine.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(NIS_RENAME) \
-	  test/engine.c src/engine.c src/ingest.c src/nis.c $(NIS_SRCS) \
+	  test/engine.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) \
 	  $(PARSE_LIB) $(LAM_LIBS) -o $@ $(LDLIBS)
 
+# The same driver under AddressSanitizer. A use-after-free in the boundary
+# between the tree, the document store and the VM is invisible without it:
+# a freed key cell is silently reused and a property becomes a different one.
+build/mdy-build-asan$(EXE): src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
+	@mkdir -p build
+	$(CC) -std=gnu11 -Wall -g -O1 -fsanitize=address -fno-omit-frame-pointer \
+	  -Isrc $(NIS_INC) $(PARSE_INC) $(NIS_RENAME) -I$(LAMASSU)/include \
+	  src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) \
+	  $(PARSE_LIB) $(LAM_LIBS) -o $@ $(LDLIBS)
+
+build/mdy-build$(EXE): src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(NIS_RENAME) \
+	  src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) \
+	  $(PARSE_LIB) $(LAM_LIBS) -o $@ $(LDLIBS)
+
+# Twice: once normally, once collecting at EVERY safe point.
+#
+# The stress pass is not belt-and-braces. This engine hands the VM values it
+# has just built, and one reachable only from the C stack is invisible to the
+# collector; freeing it does not crash, it makes a property silently become a
+# different property. Under a normal collector that needs a run long enough to
+# collect at the wrong moment — it was found by diffing a 93-page site, where
+# one link in nine hundred pointed at the wrong page. Under stress the same
+# fault shows up in the fourth check.
 check-engine: build/engine-test$(EXE)
 	@./build/engine-test$(EXE)
+	@echo "-- again, collecting at every safe point"
+	@MDY_GC_STRESS=1 ./build/engine-test$(EXE)
+
+# A whole site built both ways and diffed. SITE names the directory; there is
+# no default, because the corpus that matters is whichever one you have.
+#
+#   make check-site SITE=../../../../site
+check-site: build/mdy-build$(EXE)
+	@node scripts-compare-site.mjs "$(SITE)"
 # The 713 of mdy-docs' 776 tests that a runtime with no subprocesses, no HTTP
 # server and no WebAssembly can run. See tests-entry.mjs for what is left out
 # and why each one is a property of the runtime rather than a gap in the port.

@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "engine.h"
+#include "fsx.h"
 
 static int failures;
 
@@ -60,7 +61,226 @@ static void refuses(const char *what, const char *source, const char *expected) 
     mdy_engine_free(e);
 }
 
+
+/* ---- a directory as a site --------------------------------------------------
+ *
+ * The natives first, because they are pure, and then the whole thing: a real
+ * directory on disk, walked, rendered, and its emits collected — which is what
+ * `mdy build` is once a caller decides where the files go.
+ */
+
+/* Emits from a whole-site render, in arrival order. */
+static char emit_paths[64][256];
+static char emit_bodies[64][8192];
+static int emit_count;
+
+static void collect_all(void *ud, const char *path, const char *content) {
+    (void)ud;
+    if (emit_count >= 64) return;
+    snprintf(emit_paths[emit_count], 256, "%s", path);
+    snprintf(emit_bodies[emit_count], 8192, "%s", content);
+    emit_count++;
+}
+
+static const char *emitted(const char *path) {
+    for (int i = 0; i < emit_count; i++)
+        if (strcmp(emit_paths[i], path) == 0) return emit_bodies[i];
+    return NULL;
+}
+
+static void write_file(const char *root, const char *rel, const char *text) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s", root, rel);
+    char *slash = strrchr(path, '/');
+    if (slash) { *slash = '\0'; fsx_mkdirp(path); *slash = '/'; }
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("      cannot write %s\n", path); failures++; return; }
+    fwrite(text, 1, strlen(text), f);
+    fclose(f);
+}
+
+static void ok_(const char *what, int cond, const char *detail) {
+    printf("  %s  %s\n", cond ? "ok  " : "FAIL", what);
+    if (!cond) { printf("      actual %s\n", detail ? detail : "(null)"); failures++; }
+}
+
+static void site_checks(void) {
+    printf("\n--- engine: a directory as a site ---\n");
+
+    /* fsx_mkdtemp takes a PATH template, so the system temp directory has to
+     * be part of it — a bare prefix makes the directory in the working one,
+     * and a crashing test then leaves it in the source tree. */
+    char *tmp = fsx_tmpdir();
+    char prefix[1024];
+    snprintf(prefix, sizeof prefix, "%s/mdy-site", tmp ? tmp : ".");
+    free(tmp);
+    char *root = fsx_mkdtemp(prefix);
+    if (!root) { printf("  FAIL  cannot make a temp directory\n"); failures++; return; }
+
+    /*
+     * A site with one of each kind of file, so the dispatch is exercised by
+     * what the entry can actually SEE rather than by asserting on the walk.
+     */
+    write_file(root, "main.mdy",
+        "% for (const c of $.find({ role: 'city' })) {\n"
+        "%   $.emit(c.slug + '/index.html', $.render({ path: 'layout.mdy' }, { who: c.who }))\n"
+        "% }\n"
+        "% const notes = $.findOne({ ext: '.md' })\n"
+        "% $.emit('notes.txt', notes.body)\n"
+        "% const conf = $.findOne({ path: 'site.yaml' })\n"
+        "% $.emit('title.txt', conf.title)\n"
+        "% $.emit('tags.txt', (notes.tags || []).join(','))\n"
+        "% $.emit('words.txt', $.tokenize('The Walls of Uruk and the walls').join(','))\n"
+        "% $.emit('date.txt', $.rfc822('2026-09-05'))\n");
+    write_file(root, "layout.mdy", "= {{ req.who }}\n");
+    write_file(root, "cities/uruk.yaml", "role: city\nwho: Uruk\nslug: uruk\n");
+    write_file(root, "cities/babylon.yaml", "role: city\nwho: Babylon\nslug: babylon\n");
+    write_file(root, "site.yaml", "title: A Directory\n");
+    write_file(root, "notes.md",
+        "A {{ literal }} in prose. #uruk and #Uruk again.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "That rule above is prose, not a document separator.\n"
+        "\n"
+        "```\n"
+        "# not a tag: a shell comment in a fence\n"
+        "```\n");
+    write_file(root, "dist/stale.mdy", "= Should not be here\n");
+    write_file(root, ".hidden/secret.mdy", "= Nor this\n");
+
+    mdy_engine *e = mdy_engine_new();
+    char err[512];
+    emit_count = 0;
+    mdy_engine_on_emit(e, collect_all, NULL);
+
+    if (mdy_engine_open_dir(e, root, err, sizeof err) != 0) {
+        printf("  FAIL  open a directory\n      %s\n", err);
+        failures++;
+        mdy_engine_free(e);
+        free(root);
+        return;
+    }
+    ok_("a directory opens as a document set", mdy_engine_count(e) == 6, NULL);
+
+    int entry = mdy_engine_entry(e, "main.mdy");
+    ok_("the entry is found by path", entry >= 0, NULL);
+
+    char *html = entry >= 0 ? mdy_engine_render(e, (size_t)entry, err, sizeof err) : NULL;
+    if (!html) {
+        printf("  FAIL  the entry renders\n      %s\n", err);
+        failures++;
+        mdy_engine_free(e);
+        free(root);
+        return;
+    }
+    free(html);
+
+    /* A .yaml file's fields are its record: found by query, read by name. */
+    const char *uruk = emitted("uruk/index.html");
+    ok_("a .yaml file is a queryable document",
+        uruk && strcmp(uruk, "<h1 id=\"uruk\">Uruk</h1>") == 0, uruk);
+    ok_("...and so is every other one",
+        emitted("babylon/index.html") != NULL, NULL);
+    ok_("a data file's own field is readable",
+        emitted("title.txt") && strcmp(emitted("title.txt"), "A Directory") == 0,
+        emitted("title.txt"));
+
+    /* A .md file's text is in `body`, and was NEVER compiled — the `---` and
+     * the `{{ }}` in it are prose, and reach the entry as prose. */
+    const char *notes = emitted("notes.txt");
+    ok_("a .md file's text lands in body, uncompiled",
+        notes && strncmp(notes, "A {{ literal }} in prose.", 24) == 0, notes);
+    ok_("...a `---` line in it is prose, not a document separator",
+        mdy_engine_count(e) == 6 && strstr(notes ? notes : "", "\n---\n") != NULL, notes);
+    ok_("...byte for byte, fence and all",
+        notes && strstr(notes, "```\n# not a tag: a shell comment in a fence\n```\n") != NULL,
+        notes);
+    ok_("a .md file's hashtags are extracted, lowercased and deduplicated",
+        emitted("tags.txt") && strcmp(emitted("tags.txt"), "uruk") == 0,
+        emitted("tags.txt"));
+
+    ok_("dist/ and dotfiles are not sources", mdy_engine_count(e) == 6, NULL);
+
+    ok_("$.tokenize drops stopwords, shorts and repeats",
+        emitted("words.txt") && strcmp(emitted("words.txt"), "walls,uruk") == 0,
+        emitted("words.txt"));
+    ok_("$.rfc822 gives an RSS pubDate",
+        emitted("date.txt") &&
+            strcmp(emitted("date.txt"), "Sat, 05 Sep 2026 00:00:00 GMT") == 0,
+        emitted("date.txt"));
+
+    mdy_engine_free(e);
+    fsx_rm_rf(root);
+    free(root);
+}
+
+
+/* ---- the collector, and values this engine has just built --------------------
+ *
+ * The engine hands the VM values it makes itself: a record's keys, a tree's
+ * nodes, a query's results. A value reachable only from the C stack is
+ * invisible to the collector, and freeing one does not crash — the cell is
+ * reused for the next string, and a property quietly becomes a DIFFERENT
+ * property.
+ *
+ * The site that found this had a 642-key record come back with one key gone
+ * and another present twice, so a single link out of nine hundred pointed at
+ * the wrong page. Nothing else was wrong with the build.
+ *
+ * These run with the collector at every safe point, which is what makes the
+ * failure certain rather than occasional. Run the whole suite that way too:
+ * `MDY_GC_STRESS=1 make check-engine`.
+ */
+static void gc_checks(void) {
+    printf("\n--- engine: values the collector can see ---\n");
+
+    /*
+     * The shape the real failure had: a large record read from the store,
+     * handed to ANOTHER document as its `req`, and read back there after
+     * enough rendering in between to have collected several times.
+     */
+    char *source = malloc(900000);
+    if (!source) { printf("  FAIL  out of memory\n"); failures++; return; }
+    size_t at = 0;
+    at += (size_t)sprintf(source + at,
+        "%% const d = $.findOne({ path: 'r.mdy' })\n"
+        "%% for (let round = 0; round < 12; round++) {\n"
+        "%%   $.text({ path: 'filler.mdy' }, { n: round })\n"
+        "%% }\n"
+        "%% $.emit('bad', $.text({ path: 'reader.mdy' }, { map: d.map }))\n"
+        "---\n+++\npath: filler.mdy\n+++\n"
+        "%% let junk = []\n"
+        "%% for (let i = 0; i < 400; i++) { junk.push({ a: 'x' + i + req.n, b: [i], c: { d: 'y' + i } }) }\n"
+        "filler\n"
+        "---\n+++\npath: reader.mdy\n+++\n"
+        "%% let bad = 0\n"
+        "%% for (let i = 0; i < 800; i++) { if (req.map['k' + i] !== 'v' + i) bad++ }\n"
+        "{{ String(bad) + '/' + Object.keys(req.map).length }}\n"
+        "---\n+++\npath: r.mdy\nmap:\n");
+    for (int i = 0; i < 800; i++)
+        at += (size_t)sprintf(source + at, "  k%d: v%d\n", i, i);
+    at += (size_t)sprintf(source + at, "+++\n");
+
+    mdy_engine *e = mdy_engine_new();
+    char err[256];
+    emit_count = 0;
+    mdy_engine_on_emit(e, collect_all, NULL);
+    char *html = NULL;
+    if (mdy_engine_open(e, source, at, err, sizeof err) == 0)
+        html = mdy_engine_render(e, 0, err, sizeof err);
+    free(source);
+    free(html);
+
+    const char *got = emitted("bad");
+    ok_("every key of a large record survives collection",
+        got && strcmp(got, "0/800") == 0, got ? got : err);
+    mdy_engine_free(e);
+}
+
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("[main]\n");
     printf("--- engine: a document, end to end ---\n");
 
     check("plain markup", "= Hello\n\ntext", "<h1 id=\"hello\">Hello</h1><p>text</p>");
@@ -241,9 +461,30 @@ int main(void) {
           "{{ $.render(1) }}\n---\nouter {{ $.render(2) }}\n---\ninner\n",
           "<p>outer inner</p>");
 
-    check("$.text gives what a document wrote, without the markup",
+    /*
+     * `$.text` is the text a document's code WROTE, not its tree's text — it
+     * is never read as MDY on the way past. So the markup comes back intact
+     * and is read by whoever received it, here the heading.
+     *
+     * This check asserted the opposite until a real site disagreed: a document
+     * that writes JSON had `\"` inside a caption turned into `"`, and what
+     * came back was no longer JSON. `node bin/mdy.js build` on this same
+     * source produces the markup below.
+     */
+    check("$.text gives what a document wrote, markup and all",
           "= {{ $.text(1) }}\n---\n**bold** and //em//\n",
-          "<h1 id=\"bold-and-em\">bold and em</h1>");
+          "<h1 id=\"bold-and-em\"><strong>bold</strong> and <em>em</em></h1>");
+
+    /*
+     * The reason it must not be parsed, and the shape a real site uses: a
+     * document writes JSON, and its reader parses it. Read it as MDY on the
+     * way past and `\"` inside a string comes back as `"` — no longer JSON,
+     * and the failure lands in the caller, far from the cause.
+     */
+    check("...so JSON a document wrote parses back, escapes intact",
+          "% const o = JSON.parse($.text(1))\n= {{ o.q }}\n---\n"
+          "{{ JSON.stringify({ q: 'a \"b\" c' }) }}\n",
+          "<h1 id=\"a-b-c\">a \"b\" c</h1>");
 
     check("a token in a transformed document is still composed",
           "%% transform((tree) => {\n"
@@ -410,6 +651,9 @@ int main(void) {
         free(html);
         mdy_engine_free(e);
     }
+
+    site_checks();
+    gc_checks();
 
     if (failures) { printf("\n%d failed\n", failures); return 1; }
     printf("\nall checks passed\n");

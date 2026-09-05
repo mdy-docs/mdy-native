@@ -53,6 +53,28 @@ void mdy_engine_free(mdy_engine *engine);
 int mdy_engine_open(mdy_engine *engine, const char *source, size_t len,
                     char *error, size_t error_len);
 
+/*
+ * Open a DIRECTORY as a document set — mdy-docs' `walkSources`, where every
+ * file becomes a document and what its own file format means is applied:
+ * `.mdy` is a template, `.md` is text that is never compiled, `.yaml` is a
+ * data record, and anything else is its identity alone. `dist/`,
+ * `node_modules/` and dotfiles are not sources.
+ */
+int mdy_engine_open_dir(mdy_engine *engine, const char *root,
+                        char *error, size_t error_len);
+
+/*
+ * Every directory in the import graph, in post-order — a package comes after
+ * everything it imports. `static/` is copied in this order so a site's own
+ * files win over the ones its theme ships.
+ */
+size_t mdy_engine_root_count(mdy_engine *engine);
+const char *mdy_engine_root_at(mdy_engine *engine, size_t index);
+
+/* The document whose `path` is `entry`, or -1 — `main.mdy` is where a
+ * directory starts unless a caller says otherwise. */
+int mdy_engine_entry(mdy_engine *engine, const char *entry);
+
 /* How many documents the open set holds. */
 size_t mdy_engine_count(mdy_engine *engine);
 
