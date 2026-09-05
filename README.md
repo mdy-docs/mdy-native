@@ -546,6 +546,37 @@ one; the `tests` entry does not, so `make test` measures **mdy-docs'** behaviour
 rather than this parser's subset of it, and stays at 684 passing.
 `MDY_PARSER=c|js` overrides either way.
 
+## The ingest, in C
+
+mdy-docs puts a document's **data** into nisaba and never its text —
+`collection.insertOne({ ...doc.data })` in src/mdy.js, where `doc.data` is the
+file's identity merged with the YAML it declares. A measured build inserts 192
+documents and 4.8 MB of it, with no body anywhere.
+
+`make check-ingest` does that whole path in C, with no JavaScript in it:
+
+```
+.mdy text
+  -> mdy_data_extract     the ```data fences, and the body without them
+  -> mdy_yaml_parse       front matter, and each fence
+  -> mdy_bj_document      merged, with an _id, as binjson
+  -> dc_insert_one        into a real nisaba collection
+  -> dc_find              and back out again
+```
+
+`src/ingest.c` is the bridge: `mdy_bj_put_yaml` encodes a YAML value as
+binjson, and `mdy_bj_document` writes a document — `_id` first, then every
+mapping merged the way `Object.assign` merges them, a key keeping the position
+of its FIRST appearance and the value of its LAST. That last rule is what lets
+a ```data fence override front matter without moving it, and the test checks
+it by asserting the fence's `size: 9` beats the front matter's `size: 4`.
+
+An integral number goes in as an INT rather than a float, because a query
+written `{size: 4}` does not match a document that stored `4.0`.
+
+`_id` is a fresh ObjectId because nisaba's primary tree is keyed on
+fixed-width OID bytes and refuses anything else.
+
 ## Next
 
 The backend builds. What it does not yet do is *serve*, and the plan's Phase 1c

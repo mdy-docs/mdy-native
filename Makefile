@@ -244,7 +244,19 @@ check-golden: build/mdy-native$(EXE) build/site.js
 	done; \
 	exit $$fail
 
-.PHONY: build native site bench test test-c-parser clean
+.PHONY: build native site bench test test-c-parser check-ingest clean
+
+# A document from text into a nisaba collection, with no JavaScript in it:
+# data fences, YAML, binjson, dc_insert_one, and a query back out. This is the
+# ingest mdy.js does in JS — `collection.insertOne({ ...doc.data })` — done in
+# C, and it is the seam the engine will be built on.
+build/ingest-test$(EXE): test/ingest.c src/ingest.c src/nis.c $(NIS_SRCS) $(PARSE_LIB)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(NIS_RENAME) \
+	  test/ingest.c src/ingest.c src/nis.c $(NIS_SRCS) $(PARSE_LIB) -o $@ $(LDFLAGS)
+
+check-ingest: build/ingest-test$(EXE)
+	@./build/ingest-test$(EXE)
 # The 713 of mdy-docs' 776 tests that a runtime with no subprocesses, no HTTP
 # server and no WebAssembly can run. See tests-entry.mjs for what is left out
 # and why each one is a property of the runtime rather than a gap in the port.
