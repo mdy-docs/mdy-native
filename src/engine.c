@@ -1607,30 +1607,41 @@ static bool tokenize_native(JsContext *ctx, JsValue this_val, const JsValue *arg
     (void)this_val;
     mdy_engine *e = js_context_userdata(ctx);
     char *text = argc > 0 ? js_string_utf8(args[0]) : NULL;
-    JsValue out = js_array_new(ctx, 0);
-    if (!text) { *result = out; return true; }
-    js_gc_protect(e->vm, &out);
+    if (!text) { *result = js_array_new(ctx, 0); return true; }
 
     size_t len = strlen(text);
     char *word = malloc(len + 1);
-    if (!word) { js_gc_unprotect(e->vm, &out); free(text); *result = out; return true; }
+    /*
+     * The words are collected and deduplicated ON THIS SIDE, and the JS array
+     * is built once at the end.
+     *
+     * Asking the array what it already holds means converting every entry back
+     * out of UTF-16 for every word — quadratic, with an allocation per
+     * comparison. On a real corpus that was half of the entire build.
+     */
+    char **words = NULL;
+    size_t count = 0, cap = 0;
+    /* Open-addressed index over `words`, power of two, kept under half full. */
+    size_t *slots = NULL;
+    size_t slot_cap = 0;
+
+    if (!word) { free(text); *result = js_array_new(ctx, 0); return true; }
 
     size_t i = 0;
     while (i < len) {
         /*
          * The JavaScript lowercases the WHOLE string and only then splits on
          * `[^a-z0-9]`, so the case mapping runs first and can itself produce
-         * an ASCII letter: `İ` folds to `i`, and a name ending in one keeps
-         * its final letter. Lowercasing only ASCII drops it, and the search
-         * index then disagrees with the query the widget tokenizes.
+         * an ASCII letter: `İ` folds to `i` followed by a combining dot, which
+         * both keeps the letter and ENDS the word. Lowercasing only ASCII gets
+         * both of those wrong, and the search index then disagrees with the
+         * query the widget tokenizes.
          */
         size_t wlen = 0;
         while (i < len) {
             uint32_t cp = 0, lc[2];
             size_t w = mdy_utf8_decode(text + i, len - i, &cp);
             size_t n = mdy_lower_full(cp, lc);
-            /* One character can lower to two, and the second can be the thing
-             * that ENDS the word: `İ` is `i` and a combining dot. */
             if (!((lc[0] >= 'a' && lc[0] <= 'z') || (lc[0] >= '0' && lc[0] <= '9'))) break;
             word[wlen++] = (char)lc[0];
             i += w;
@@ -1644,20 +1655,64 @@ static bool tokenize_native(JsContext *ctx, JsValue this_val, const JsValue *arg
             if ((lc[0] >= 'a' && lc[0] <= 'z') || (lc[0] >= '0' && lc[0] <= '9')) break;
             i += w;
         }
+        word[wlen] = '\0';
         if (wlen <= 1 || is_stopword(word, wlen)) continue;
 
-        int seen = 0;                           /* `new Set`: first appearance wins */
-        uint32_t n = js_array_length(out);
-        for (uint32_t k = 0; k < n && !seen; k++) {
-            char *have = js_string_utf8(js_array_get(out, k));
-            seen = have && strlen(have) == wlen && memcmp(have, word, wlen) == 0;
-            free(have);
+        if (count * 2 + 2 > slot_cap) {         /* grow and rehash */
+            size_t want = slot_cap ? slot_cap * 2 : 64;
+            size_t *grown = malloc(want * sizeof *grown);
+            if (!grown) break;
+            for (size_t k = 0; k < want; k++) grown[k] = (size_t)-1;
+            for (size_t k = 0; k < count; k++) {
+                size_t h = 1469598103934665603u;
+                for (const char *p = words[k]; *p; p++)
+                    h = (h ^ (unsigned char)*p) * 1099511628211u;
+                size_t at = h & (want - 1);
+                while (grown[at] != (size_t)-1) at = (at + 1) & (want - 1);
+                grown[at] = k;
+            }
+            free(slots);
+            slots = grown;
+            slot_cap = want;
         }
-        if (!seen) push_item(e, out, str(e->vm, word, wlen));
+
+        size_t h = 1469598103934665603u;
+        for (size_t k = 0; k < wlen; k++) h = (h ^ (unsigned char)word[k]) * 1099511628211u;
+        size_t at = h & (slot_cap - 1);
+        int seen = 0;
+        while (slots[at] != (size_t)-1) {
+            const char *have = words[slots[at]];
+            if (strlen(have) == wlen && memcmp(have, word, wlen) == 0) { seen = 1; break; }
+            at = (at + 1) & (slot_cap - 1);
+        }
+        if (seen) continue;
+
+        if (count == cap) {
+            size_t want = cap ? cap * 2 : 32;
+            char **grown = realloc(words, want * sizeof *grown);
+            if (!grown) break;
+            words = grown;
+            cap = want;
+        }
+        words[count] = malloc(wlen + 1);
+        if (!words[count]) break;
+        memcpy(words[count], word, wlen + 1);
+        slots[at] = count;
+        count++;
     }
-    js_gc_unprotect(e->vm, &out);
     free(word);
     free(text);
+    free(slots);
+
+    /* In order of first appearance, which is what `new Set` preserves. */
+    JsValue out = js_array_new(ctx, (uint32_t)count);
+    js_gc_protect(e->vm, &out);
+    for (size_t k = 0; k < count; k++) {
+        push_item(e, out, str(e->vm, words[k], strlen(words[k])));
+        free(words[k]);
+    }
+    js_gc_unprotect(e->vm, &out);
+    free(words);
     *result = out;
     return true;
 }
