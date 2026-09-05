@@ -13,8 +13,12 @@
 # — lamassu has no #ifdefs at all and nisaba's I/O is behind its bj_io
 # callbacks. See docs/desktop-plan.md, Phase 4.
 
-NISABA  ?= ../../third_party/nisaba-db
-LAMASSU ?= ../../third_party/lamassu-js
+# Submodules of this repository, so the C engine and its tests build from a
+# clean clone. Inside an mdy-docs checkout they are the same two checkouts one
+# level up, and pointing these at those avoids a second copy:
+#     make NISABA=../../third_party/nisaba-db LAMASSU=../../third_party/lamassu-js
+NISABA  ?= third_party/nisaba-db
+LAMASSU ?= third_party/lamassu-js
 QUICKJS ?= third_party/quickjs
 
 # gnu11, not c11. glibc hides POSIX declarations under a strict standard —

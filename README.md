@@ -2,8 +2,44 @@
 
 The backend as a binary: mdy-docs' own JavaScript in QuickJS, with the engines
 linked as C rather than loaded as WebAssembly. No renderer, no webview, no
-memory ceiling. See [docs/desktop-plan.md](../../docs/desktop-plan.md) —
-"The backend is not a webview" — for the measurements that chose this.
+memory ceiling. See mdy-docs' `docs/desktop-plan.md` — "The backend is not a
+webview" — for the measurements that chose this.
+
+Beside it, and now the larger half, is a C ENGINE that runs a site with no
+QuickJS at all: the walk, the document store, the templates, composition and
+the output are C, and lamassu runs only the template code. `build/mdy-build`
+is that engine as a command.
+
+```sh
+git clone --recurse-submodules https://github.com/mdy-docs/mdy-native
+cd mdy-native
+make -C third_party/parse           # the front end builds its own library
+make build/mdy-build                # the C engine
+./build/mdy-build <site-dir> --out <dir>
+```
+
+## This repository is a package of mdy-docs
+
+It is `packages/mdy-native` of [mdy-docs](https://github.com/mdy-docs/mdy-docs),
+exported with its history, and the split is worth understanding before
+something fails to build:
+
+- **The C engine stands alone.** `make build/mdy-build`, `make check-engine`
+  and `make check-ingest` need only this checkout and its submodules — nisaba,
+  lamassu and the parse front end are all here.
+- **Everything involving mdy-docs' own JavaScript does not.** `make native`,
+  `make test`, `make site`, `make bench` and `make check-site` run mdy-docs'
+  code — its `index.js`, its `bin/mdy.js`, its `test/`. Those targets work
+  when this sits at `packages/mdy-native` inside an mdy-docs checkout, and
+  not otherwise. `make check-site` in particular builds a site BOTH ways and
+  diffs them, which is the whole point of it.
+
+Inside an mdy-docs checkout, point the two engine paths at the copies already
+there rather than checking out a second pair:
+
+```sh
+make NISABA=../../third_party/nisaba-db LAMASSU=../../third_party/lamassu-js …
+```
 
 ```sh
 make native            # build both halves, run the checks
