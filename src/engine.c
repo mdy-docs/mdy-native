@@ -11,9 +11,22 @@
 #include "mdydata.h"
 #include "mdydoc.h"
 #include "mdyhtml.h"
+#include "binjson.h"
+#include "bplustree.h"
+#include "db.h"
+#include "ingest.h"
+
 #include "mdybuild.h"
 #include "mdyscript.h"
 #include "toolkit.h"
+
+/* One document of an open set. Its TEXT is here; its DATA is in nisaba. */
+typedef struct {
+    mdy_chunk chunk;      /* the document's own text */
+    mdy_chunk matter;     /* its front matter, unparsed */
+    mdy_data *fences;     /* its ```data fences, and the body without them */
+    uint8_t oid[12];
+} Document;
 
 struct mdy_engine {
     JsVm *vm;
@@ -24,6 +37,14 @@ struct mdy_engine {
      * time this is where it lives.
      */
     mdy_doc *tree_owner;
+
+    /* The open set. */
+    Document *docs;
+    size_t count;
+    int handle;                 /* nisaba's, from nis_open */
+    mdy_documents *source_docs;
+    /* `_id` to index, in insertion order, so a hit maps back to its document. */
+    uint8_t (*ids)[12];
 };
 
 /* ---- strings across the boundary ------------------------------------------- */
@@ -257,6 +278,410 @@ static mdy_node *js_to_tree(mdy_engine *e, mdy_doc *doc, JsValue v) {
     return out;
 }
 
+
+/* ---- the document set --------------------------------------------------------
+ *
+ * Opening a source is mdy-docs' `openDocumentSet`: every document's data — its
+ * front matter merged with its ```data fences — goes into a nisaba collection,
+ * and `$.find` runs real queries against it.
+ *
+ * The `_id` to index map is not bookkeeping. A query answers in whatever order
+ * the database walks its keys, and a document set answers in DOCUMENT order —
+ * so a hit is mapped back to the document it came from and the answer sorted
+ * by that. Without it a page's list of siblings would reorder between builds.
+ */
+
+/* ---- a JS value as binjson, for a query filter ------------------------------ */
+
+static int js_to_binjson(mdy_engine *e, bj_builder *b, JsValue v) {
+    if (js_is_null(v) || js_is_undefined(v)) return bj_put_null(b);
+    if (js_is_bool(v)) return bj_put_bool(b, js_get_bool(v));
+    if (js_is_number(v)) {
+        double d = js_get_number(v);
+        if (d == (double)(int64_t)d && d >= -9.2e18 && d <= 9.2e18)
+            return bj_put_int(b, (int64_t)d);
+        return bj_put_float(b, d);
+    }
+    if (js_is_string(v)) {
+        char *s = js_string_utf8(v);
+        if (!s) return -1;
+        int rc = bj_put_string(b, (const uint8_t *)s, (uint32_t)strlen(s));
+        free(s);
+        return rc;
+    }
+    if (js_is_array(v)) {
+        if (bj_begin_array(b) != 0) return -1;
+        uint32_t n = js_array_length(v);
+        for (uint32_t i = 0; i < n; i++)
+            if (js_to_binjson(e, b, js_array_get(v, i)) != 0) return -1;
+        return bj_end_array(b);
+    }
+    if (js_is_object(v)) {
+        if (bj_begin_object(b) != 0) return -1;
+        size_t n = js_object_size(v);
+        for (size_t i = 0; i < n; i++) {
+            JsValue k = js_object_key_at(v, i);
+            char *name = js_string_utf8(k);
+            if (!name) continue;
+            int rc = bj_put_key(b, (const uint8_t *)name, (uint32_t)strlen(name));
+            free(name);
+            if (rc != 0) return -1;
+            if (js_to_binjson(e, b, js_object_get(e->vm, v, k)) != 0) return -1;
+        }
+        return bj_end_object(b);
+    }
+    return bj_put_null(b);
+}
+
+/* ---- binjson back as JS values ----------------------------------------------
+ *
+ * The decoder is a visitor, so this keeps a stack of the containers it is
+ * inside and hangs each finished value on whichever is on top.
+ */
+enum { BJ_STACK_MAX = 64 };
+
+typedef struct {
+    mdy_engine *e;
+    JsValue stack[BJ_STACK_MAX];
+    char *keys[BJ_STACK_MAX];
+    int depth;
+    JsValue result;
+    int have_result;
+} Decode;
+
+static void decode_put(Decode *d, JsValue v) {
+    if (d->depth == 0) { d->result = v; d->have_result = 1; return; }
+    JsValue parent = d->stack[d->depth - 1];
+    if (js_is_array(parent)) {
+        js_array_push(d->e->vm, parent, v);
+    } else {
+        char *k = d->keys[d->depth - 1];
+        if (k) {
+            js_object_set(d->e->vm, parent, key(d->e->vm, k), v);
+            free(k);
+            d->keys[d->depth - 1] = NULL;
+        }
+    }
+}
+
+static void d_null(void *ctx) { decode_put(ctx, js_null()); }
+static void d_bool(void *ctx, int t) { decode_put(ctx, js_bool(t != 0)); }
+static void d_int(void *ctx, double v) { decode_put(ctx, js_number(v)); }
+static void d_float(void *ctx, double v) { decode_put(ctx, js_number(v)); }
+static void d_date(void *ctx, double v) { decode_put(ctx, js_number(v)); }
+static void d_pointer(void *ctx, double v) { decode_put(ctx, js_number(v)); }
+static void d_string(void *ctx, const uint8_t *s, uint32_t n) {
+    Decode *d = ctx;
+    decode_put(d, str(d->e->vm, (const char *)s, n));
+}
+static void d_binary(void *ctx, const uint8_t *s, uint32_t n) {
+    (void)s; (void)n;
+    decode_put(ctx, js_null());
+}
+/* `_id` is an OID, and a document set's own key: guest code has no use for
+ * the bytes, and a string of them is the shape mdy-docs hands over. */
+static void d_oid(void *ctx, const uint8_t *b) {
+    Decode *d = ctx;
+    char hex[25];
+    static const char *H = "0123456789abcdef";
+    for (int i = 0; i < 12; i++) { hex[i * 2] = H[b[i] >> 4]; hex[i * 2 + 1] = H[b[i] & 15]; }
+    hex[24] = '\0';
+    decode_put(d, str(d->e->vm, hex, 24));
+}
+static void d_array_begin(void *ctx, uint32_t count) {
+    Decode *d = ctx;
+    (void)count;
+    if (d->depth >= BJ_STACK_MAX) return;
+    JsValue a = js_array_new(d->e->ctx, count);
+    js_gc_protect(d->e->vm, &a);
+    d->keys[d->depth] = NULL;
+    d->stack[d->depth++] = a;
+}
+static void d_object_begin(void *ctx, uint32_t count) {
+    Decode *d = ctx;
+    (void)count;
+    if (d->depth >= BJ_STACK_MAX) return;
+    JsValue o = js_object_new(d->e->ctx);
+    js_gc_protect(d->e->vm, &o);
+    d->keys[d->depth] = NULL;
+    d->stack[d->depth++] = o;
+}
+static void d_key(void *ctx, const uint8_t *s, uint32_t n) {
+    Decode *d = ctx;
+    if (d->depth == 0) return;
+    free(d->keys[d->depth - 1]);
+    d->keys[d->depth - 1] = malloc(n + 1);
+    if (d->keys[d->depth - 1]) {
+        memcpy(d->keys[d->depth - 1], s, n);
+        d->keys[d->depth - 1][n] = '\0';
+    }
+}
+static void d_end(void *ctx) {
+    Decode *d = ctx;
+    if (d->depth == 0) return;
+    JsValue done = d->stack[--d->depth];
+    free(d->keys[d->depth]);
+    d->keys[d->depth] = NULL;
+    js_gc_unprotect(d->e->vm, &done);
+    decode_put(d, done);
+}
+
+static JsValue binjson_to_js(mdy_engine *e, const uint8_t *bytes, size_t len, size_t *consumed) {
+    Decode d = {0};
+    d.e = e;
+    d.result = js_undefined();
+    bj_visitor v = {
+        .on_null = d_null, .on_bool = d_bool, .on_int = d_int, .on_float = d_float,
+        .on_string = d_string, .on_binary = d_binary, .on_oid = d_oid, .on_date = d_date,
+        .on_pointer = d_pointer, .on_array_begin = d_array_begin, .on_array_end = d_end,
+        .on_object_begin = d_object_begin, .on_key = d_key, .on_object_end = d_end,
+        .ctx = &d,
+    };
+    if (bj_decode(bytes, len, &v, consumed) != 0) return js_undefined();
+    return d.result;
+}
+
+
+/* ---- opening a set ---------------------------------------------------------- */
+
+/* nisaba keys its primary tree on OID bytes and needs a file behind it; a set
+ * built from a source is in memory, so this is a temporary the OS reclaims. */
+extern int nis_open(void);
+extern int nis_insert(int handle, const uint8_t *doc, uint32_t len);
+extern int nis_find(int handle, const uint8_t *filter, uint32_t filter_len,
+                    uint8_t **out, size_t *out_len);
+extern int nis_create_index(int handle, const char *name, const uint8_t *fields,
+                            uint32_t fields_len, int unique, int sparse);
+
+static void close_set(mdy_engine *e) {
+    for (size_t i = 0; i < e->count; i++) mdy_data_free(e->docs[i].fences);
+    free(e->docs);
+    free(e->ids);
+    mdy_documents_free(e->source_docs);
+    e->docs = NULL;
+    e->ids = NULL;
+    e->source_docs = NULL;
+    e->count = 0;
+}
+
+int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
+                    char *error, size_t error_len) {
+    if (error && error_len) error[0] = '\0';
+    close_set(e);
+
+    e->source_docs = mdy_split_documents(source, len);
+    if (!e->source_docs) return -1;
+
+    size_t n = mdy_documents_count(e->source_docs);
+    e->docs = calloc(n ? n : 1, sizeof *e->docs);
+    e->ids = calloc(n ? n : 1, sizeof *e->ids);
+    if (!e->docs || !e->ids) { close_set(e); return -1; }
+    e->count = n;
+
+    if (e->handle < 0) {
+        e->handle = nis_open();
+        if (e->handle < 0) {
+            if (error && error_len) snprintf(error, error_len, "could not open a collection");
+            close_set(e);
+            return -1;
+        }
+    }
+
+    /*
+     * `path` is the natural key of a set built from a directory, and every
+     * `$.render({ path: … })` resolves through a query on it — so without the
+     * index each one is a scan of the whole set. SPARSE because a document
+     * need not have a path at all, and NOT unique because one file can hold
+     * several documents and they all carry its path.
+     *
+     * It is also what makes the document-order sort do real work: a query
+     * answered from an index comes back in INDEX order, not `_id` order.
+     */
+    {
+        bj_builder *spec = bj_builder_new();
+        if (spec) {
+            bj_begin_object(spec);
+            bj_put_key(spec, (const uint8_t *)"path", 4);
+            bj_put_int(spec, 1);
+            bj_end_object(spec);
+            size_t slen = 0;
+            const uint8_t *bytes = bj_builder_data(spec, &slen);
+            nis_create_index(e->handle, "path", bytes, (uint32_t)slen, 0, 1);
+            bj_builder_free(spec);
+        }
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        Document *d = &e->docs[i];
+        d->chunk = mdy_documents_at(e->source_docs, i);
+        mdy_chunk body;
+        mdy_split_frontmatter(d->chunk.text, d->chunk.len, &d->matter, &body);
+        d->fences = mdy_data_extract(body.text, body.len);
+
+        /*
+         * The document's DATA: its front matter, with each ```data fence
+         * merged over it — `Object.assign({}, frontMatter, ...blocks)`. Its
+         * text never goes in, which is what a measured build of mdy-docs
+         * shows it doing.
+         */
+        char err[256];
+        mdy_yaml *matter = NULL;
+        if (d->matter.len) matter = mdy_yaml_parse(d->matter.text, d->matter.len, err, sizeof err);
+
+        size_t fence_count = d->fences ? mdy_data_count(d->fences) : 0;
+        const mdy_yaml_node **maps = calloc(fence_count + 1, sizeof *maps);
+        mdy_yaml **parsed = calloc(fence_count + 1, sizeof *parsed);
+        if (!maps || !parsed) { free(maps); free(parsed); mdy_yaml_free(matter); close_set(e); return -1; }
+
+        size_t used = 0;
+        if (matter) maps[used++] = mdy_yaml_root(matter);
+        for (size_t f = 0; f < fence_count; f++) {
+            const mdy_data_fence *fence = mdy_data_at(d->fences, f);
+            mdy_yaml *y = mdy_yaml_parse(fence->source, fence->source_len, err, sizeof err);
+            if (!y) continue;
+            parsed[f] = y;
+            maps[used++] = mdy_yaml_root(y);
+        }
+
+        mdy_oid_next(d->oid);
+        memcpy(e->ids[i], d->oid, 12);
+
+        bj_builder *b = bj_builder_new();
+        int ok = b && mdy_bj_document(b, d->oid, maps, used) == 0 && !bj_builder_error(b);
+        if (ok) {
+            size_t dlen = 0;
+            const uint8_t *bytes = bj_builder_data(b, &dlen);
+            ok = bytes && nis_insert(e->handle, bytes, (uint32_t)dlen) == 0;
+        }
+        bj_builder_free(b);
+        mdy_yaml_free(matter);
+        for (size_t f = 0; f < fence_count; f++) mdy_yaml_free(parsed[f]);
+        free(maps);
+        free(parsed);
+
+        if (!ok) {
+            if (error && error_len)
+                snprintf(error, error_len, "document %zu could not be inserted", i);
+            close_set(e);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+size_t mdy_engine_count(mdy_engine *e) { return e ? e->count : 0; }
+
+/* ---- querying ---------------------------------------------------------------
+ *
+ * A hit carries the `_id` it was inserted with, so it maps back to the
+ * document it came from — and the answer is sorted by that, not by whatever
+ * order the database walked its keys in. That is what makes a query's answer
+ * the same on every build.
+ */
+static int index_of_id(mdy_engine *e, const char *hex) {
+    static const char *H = "0123456789abcdef";
+    for (size_t i = 0; i < e->count; i++) {
+        char have[25];
+        for (int k = 0; k < 12; k++) {
+            have[k * 2] = H[e->ids[i][k] >> 4];
+            have[k * 2 + 1] = H[e->ids[i][k] & 15];
+        }
+        have[24] = '\0';
+        if (strcmp(have, hex) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static JsValue run_query(mdy_engine *e, JsValue query, int one) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return js_undefined();
+    if (js_is_object(query) && !js_is_array(query)) {
+        if (js_to_binjson(e, b, query) != 0) { bj_builder_free(b); return js_undefined(); }
+    } else {
+        bj_begin_object(b);
+        bj_end_object(b);
+    }
+    size_t flen = 0;
+    const uint8_t *filter = bj_builder_data(b, &flen);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    int rc = nis_find(e->handle, filter, (uint32_t)flen, &out, &out_len);
+    bj_builder_free(b);
+    if (rc != 0 || !out) return one ? js_null() : js_array_new(e->ctx, 0);
+
+    /* The result is a binjson ARRAY of documents. */
+    JsValue hits = binjson_to_js(e, out, out_len, NULL);
+    free(out);
+    if (!js_is_array(hits)) return one ? js_null() : js_array_new(e->ctx, 0);
+    js_gc_protect(e->vm, &hits);
+
+    /* Back into document order. */
+    uint32_t n = js_array_length(hits);
+    JsValue ordered = js_array_new(e->ctx, n);
+    js_gc_protect(e->vm, &ordered);
+    for (size_t want = 0; want < e->count; want++) {
+        for (uint32_t i = 0; i < n; i++) {
+            JsValue hit = js_array_get(hits, i);
+            char *id = js_string_utf8(js_object_get(e->vm, hit, key(e->vm, "_id")));
+            if (!id) continue;
+            int at = index_of_id(e, id);
+            free(id);
+            if (at == (int)want) js_array_push(e->vm, ordered, hit);
+        }
+    }
+    js_gc_unprotect(e->vm, &ordered);
+    js_gc_unprotect(e->vm, &hits);
+
+    if (!one) return ordered;
+    return js_array_length(ordered) > 0 ? js_array_get(ordered, 0) : js_null();
+}
+
+static bool find_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                        int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    *result = run_query(e, argc > 0 ? args[0] : js_undefined(), 0);
+    return true;
+}
+
+static bool find_one_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                            int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    *result = run_query(e, argc > 0 ? args[0] : js_undefined(), 1);
+    return true;
+}
+
+/* `$.data(i)` — a document's own data, by index, without a query. */
+static bool data_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                        int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    if (argc < 1 || !js_is_number(args[0])) { *result = js_null(); return true; }
+    double at = js_get_number(args[0]);
+    if (at < 0 || at >= (double)e->count) { *result = js_null(); return true; }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { *result = js_null(); return true; }
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"_id", 3);
+    bj_put_oid(b, e->ids[(size_t)at]);
+    bj_end_object(b);
+    size_t flen = 0;
+    const uint8_t *filter = bj_builder_data(b, &flen);
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    int rc = nis_find(e->handle, filter, (uint32_t)flen, &out, &out_len);
+    bj_builder_free(b);
+    if (rc != 0 || !out) { *result = js_null(); return true; }
+    JsValue hits = binjson_to_js(e, out, out_len, NULL);
+    free(out);
+    *result = js_is_array(hits) && js_array_length(hits) > 0 ? js_array_get(hits, 0) : js_null();
+    return true;
+}
+
 /* ---- `$`, with every native refusing ---------------------------------------
  *
  * A native that is not implemented THROWS, naming itself. The alternative — a
@@ -329,6 +754,9 @@ static void register_one(mdy_engine *e, const char *name, JsNativeFn fn) {
 static void register_natives(mdy_engine *e) {
     register_one(e, "__native", refuse);
     register_one(e, "__compose", compose_native);
+    register_one(e, "__find", find_native);
+    register_one(e, "__findOne", find_one_native);
+    register_one(e, "__data", data_native);
 }
 
 /*
@@ -352,6 +780,7 @@ mdy_engine *mdy_engine_new(void) {
     JsVmConfig cfg = {0};
     e->vm = js_vm_new(&cfg);
     if (!e->vm) { free(e); return NULL; }
+    e->handle = -1;
     e->ctx = js_context_new(e->vm);
     if (!e->ctx) { js_vm_free(e->vm); free(e); return NULL; }
     /* So a native can find the engine it belongs to. */
@@ -362,18 +791,11 @@ mdy_engine *mdy_engine_new(void) {
 
 void mdy_engine_free(mdy_engine *e) {
     if (!e) return;
+    close_set(e);
     mdy_free(e->tree_owner);
     js_context_free(e->ctx);
     js_vm_free(e->vm);
     free(e);
-}
-
-size_t mdy_engine_count(mdy_engine *e, const char *source, size_t len) {
-    (void)e;
-    mdy_documents *docs = mdy_split_documents(source, len);
-    size_t n = mdy_documents_count(docs);
-    mdy_documents_free(docs);
-    return n;
 }
 
 /*
@@ -393,9 +815,9 @@ static char *wrap(const char *statements) {
     static const char OPEN[] =
         "(async (req, res, $$) => {\n"
         "const $ = {\n"
-        "  find: (q) => __native('find', q),\n"
-        "  findOne: (q) => __native('findOne', q),\n"
-        "  withTag: (t) => __native('withTag', t),\n"
+        "  find: (q) => __find(q === undefined ? {} : q),\n"
+        "  findOne: (q) => __findOne(q === undefined ? {} : q),\n"
+        "  withTag: (t) => __find({ tags: String(t).toLowerCase() }),\n"
         "  render: (t, d) => __native('render', t, d),\n"
         "  text: (t, d) => __native('text', t, d),\n"
         "  emit: (p, c) => __native('emit', p, c),\n"
@@ -406,7 +828,7 @@ static char *wrap(const char *statements) {
         "  html: (v) => __native('html', v),\n"
         "  table: (r, a) => __native('table', r, a),\n"
         "  toc: (t) => __native('toc', t),\n"
-        "  data: (i) => __native('data', i),\n"
+        "  data: (i) => __data(i),\n"
         "  compose: (o) => __compose(o),\n"
         "};\n"
         "const __transforms = [];\n"
@@ -499,34 +921,24 @@ static mdy_doc *parse_lines(JsValue out, mdy_engine *e) {
     return tree;
 }
 
-char *mdy_engine_render(mdy_engine *e, const char *source, size_t len,
-                        size_t index, char *error, size_t error_len) {
+char *mdy_engine_render(mdy_engine *e, size_t index, char *error, size_t error_len) {
     if (error && error_len) error[0] = '\0';
     char *html = NULL;
+    mdy_script *script = NULL;
 
 #define FAIL(...) do { if (error && error_len) snprintf(error, error_len, __VA_ARGS__); goto done; } while (0)
 
-    mdy_documents *docs = mdy_split_documents(source, len);
-    if (!docs) return NULL;
-    if (index >= mdy_documents_count(docs)) {
+    if (index >= e->count) {
         if (error && error_len) snprintf(error, error_len, "no document at index %zu", index);
-        mdy_documents_free(docs);
         return NULL;
     }
-
-    mdy_chunk chunk = mdy_documents_at(docs, index);
-
-    /* 1. the data at the top, and the fences in the body */
-    mdy_chunk matter, body;
-    mdy_split_frontmatter(chunk.text, chunk.len, &matter, &body);
-    mdy_data *data = mdy_data_extract(body.text, body.len);
-
+    Document *d = &e->docs[index];
+    /* 1. the body, which `mdy_engine_open` already took the data out of */
     size_t template_len = 0;
-    const char *template_text = data ? mdy_data_body(data, &template_len) : body.text;
-    if (!data) template_len = body.len;
+    const char *template_text = mdy_data_body(d->fences, &template_len);
 
     /* 2. the script layer */
-    mdy_script *script = mdy_script_compile(template_text, template_len);
+    script = mdy_script_compile(template_text, template_len);
     if (!script) FAIL("the script layer could not compile this document");
 
     size_t src_len = 0;
@@ -616,7 +1028,5 @@ done:
     mdy_free(e->tree_owner);
     e->tree_owner = NULL;
     mdy_script_free(script);
-    mdy_data_free(data);
-    mdy_documents_free(docs);
     return html;
 }

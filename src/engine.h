@@ -38,15 +38,31 @@ mdy_engine *mdy_engine_new(void);
 void mdy_engine_free(mdy_engine *engine);
 
 /*
- * Render the document at `index` of `source` to HTML. Caller frees.
+ * OPEN a source as a document set, then render from it.
+ *
+ * Opening is where the set becomes queryable: every document's data — its
+ * front matter merged with its ```data fences — is inserted into a nisaba
+ * collection, and `$.find` and `$.findOne` run real queries against it. That
+ * is mdy-docs' `openDocumentSet`, and it is why rendering takes an index into
+ * an open set rather than a source and an offset.
+ *
+ * Results come back in DOCUMENT order, not the order the database returns
+ * them: an `_id` to index map restores it, which is what makes a query's
+ * answer the same on every build.
+ */
+int mdy_engine_open(mdy_engine *engine, const char *source, size_t len,
+                    char *error, size_t error_len);
+
+/* How many documents the open set holds. */
+size_t mdy_engine_count(mdy_engine *engine);
+
+/*
+ * Render the document at `index` to HTML. Caller frees.
  *
  * NULL on failure, with a message written into `error` — a compile error from
  * lamassu, a refused native, or anything the document threw.
  */
-char *mdy_engine_render(mdy_engine *engine, const char *source, size_t len,
-                        size_t index, char *error, size_t error_len);
-
-/* How many documents the source holds. */
-size_t mdy_engine_count(mdy_engine *engine, const char *source, size_t len);
+char *mdy_engine_render(mdy_engine *engine, size_t index,
+                        char *error, size_t error_len);
 
 #endif

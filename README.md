@@ -607,6 +607,31 @@ request.
 undefined produces a page quietly missing whatever the document asked for,
 which is the failure this project has been most careful to avoid.
 
+### The set, queried
+
+`mdy_engine_open` is mdy-docs' `openDocumentSet`: every document's data — its
+front matter merged with its ```data fences, and **never its text** — goes into
+a nisaba collection, and `$.find`, `$.findOne`, `$.withTag` and `$.data` run
+real queries against it.
+
+A query object crosses as binjson built from the guest's own value, and the
+documents come back as guest values through binjson's decoder — no JSON in
+either direction. The `path` index is attached at open for the reason mdy-docs
+gives: every `$.render({ path: … })` resolves through a query on it, and
+without the index each one is a scan of the whole set.
+
+Ten checks, including the ones that would be silently wrong: a fence overriding
+the front matter it merges over, a number staying a number, and the body text
+being nowhere in the database.
+
+One of them is labelled for what it does NOT prove. "Several hits come back
+with their documents, in order" passes with the ordering pass removed, because
+nisaba's ObjectIds are monotonic — the primary tree already walks in insertion
+order, and an index ties break by `_id`, which is that order again. I could not
+construct a case that tells them apart. The sort stays because mdy-docs sorts,
+and the `_id` to index map earns its place regardless: resolving a hit back to
+its document is what `$.render({ … })` needs.
+
 ### transform: the tree through lamassu and back
 
 `transform((tree) => …)` is the one place a document's own code sees its tree,

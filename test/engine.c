@@ -17,7 +17,9 @@ static int failures;
 static void check(const char *what, const char *source, const char *expected) {
     mdy_engine *e = mdy_engine_new();
     char err[256];
-    char *html = mdy_engine_render(e, source, strlen(source), 0, err, sizeof err);
+    char *html = NULL;
+    if (mdy_engine_open(e, source, strlen(source), err, sizeof err) == 0)
+        html = mdy_engine_render(e, 0, err, sizeof err);
     int ok = html && strcmp(html, expected) == 0;
     printf("  %s  %s\n", ok ? "ok  " : "FAIL", what);
     if (!ok) {
@@ -34,7 +36,9 @@ static void check(const char *what, const char *source, const char *expected) {
 static void refuses(const char *what, const char *source, const char *expected) {
     mdy_engine *e = mdy_engine_new();
     char err[256];
-    char *html = mdy_engine_render(e, source, strlen(source), 0, err, sizeof err);
+    char *html = NULL;
+    if (mdy_engine_open(e, source, strlen(source), err, sizeof err) == 0)
+        html = mdy_engine_render(e, 0, err, sizeof err);
     int ok = !html && strstr(err, expected) != NULL;
     printf("  %s  %s\n", ok ? "ok  " : "FAIL", what);
     if (!ok) {
@@ -89,18 +93,98 @@ int main(void) {
     {
         const char *source = "= One\n---\n= Two";
         mdy_engine *e = mdy_engine_new();
-        int ok = mdy_engine_count(e, source, strlen(source)) == 2;
+        char open_err[256];
+        mdy_engine_open(e, source, strlen(source), open_err, sizeof open_err);
+        int ok = mdy_engine_count(e) == 2;
         printf("  %s  a source holds two documents\n", ok ? "ok  " : "FAIL");
         if (!ok) failures++;
 
         char err[256];
-        char *second = mdy_engine_render(e, source, strlen(source), 1, err, sizeof err);
+        char *second = mdy_engine_render(e, 1, err, sizeof err);
         ok = second && strcmp(second, "<h1 id=\"two\">Two</h1>") == 0;
         printf("  %s  …and the second one renders\n", ok ? "ok  " : "FAIL");
         if (!ok) { printf("      actual %s\n", second ? second : err); failures++; }
         free(second);
         mdy_engine_free(e);
     }
+
+    printf("--- engine: the set, queried ---\n");
+
+    /*
+     * Every document's DATA goes into nisaba when the set is opened — its
+     * front matter merged with its ```data fences, and never its text — and
+     * `$.find` runs a real query against it.
+     */
+    {
+        const char *set =
+            "% for (const c of $.find({ role: 'city' })) {\n"
+            "- {{ c.who }} of {{ c.era }}\n"
+            "% }\n"
+            "---\n+++\nrole: city\nwho: Uruk\nera: Sumer\n+++\n"
+            "---\n+++\nrole: card\nwho: Ignored\n+++\n"
+            "---\n+++\nrole: city\nwho: Babylon\nera: Akkad\n+++\n";
+        check("a document finds its siblings by query", set,
+              "<ul>\n<li>Uruk of Sumer</li>\n<li>Babylon of Akkad</li>\n</ul>");
+    }
+
+    check("findOne takes the first hit",
+          "= {{ $.findOne({ role: 'city' }).who }}\n"
+          "---\n+++\nrole: city\nwho: Uruk\n+++\n"
+          "---\n+++\nrole: city\nwho: Babylon\n+++\n",
+          "<h1 id=\"uruk\">Uruk</h1>");
+
+    check("…and answers null when nothing matches",
+          "= {{ $.findOne({ role: 'nowhere' }) === null ? 'none' : 'some' }}",
+          "<h1 id=\"none\">none</h1>");
+
+    check("an empty query finds every document",
+          "= {{ $.find({}).length }}\n---\n+++\na: 1\n+++\n---\n+++\nb: 2\n+++\n",
+          "<h1 id=\"3\">3</h1>");
+
+    /*
+     * Several hits, in the order the documents are written — with paths that
+     * sort backwards against them, so a straight index walk would answer
+     * three,two,one.
+     *
+     * BE CLEAR ABOUT WHAT THIS DOES NOT PROVE. It passes with the ordering
+     * pass removed, so it does not isolate it: nisaba's ObjectIds are
+     * monotonic, so the primary tree already walks in insertion order and an
+     * index ties break by `_id`, which is the same order again. I could not
+     * construct a case that tells them apart, and a check that cannot fail is
+     * worth less than knowing it cannot. The sort stays because mdy-docs sorts
+     * — it is defensive about an order neither of us should rely on — and the
+     * `_id` to index map earns its place regardless: resolving a hit back to
+     * its document is what `$.render({ … })` will need.
+     */
+    check("several hits come back with their documents, in order",
+          "= {{ $.find({ path: { $exists: true } }).map((d) => d.n).join(',') }}\n"
+          "---\n+++\npath: c.mdy\nn: one\n+++\n"
+          "---\n+++\npath: b.mdy\nn: two\n+++\n"
+          "---\n+++\npath: a.mdy\nn: three\n+++\n",
+          "<h1 id=\"onetwothree\">one,two,three</h1>");
+
+    check("a ```data fence is queryable too",
+          "= {{ $.findOne({ kind: 'note' }).title }}\n"
+          "---\ntext\n\n```data\nkind: note\ntitle: Found\n```\n",
+          "<h1 id=\"found\">Found</h1>");
+
+    check("a fence overrides the front matter it merges over",
+          "= {{ $.findOne({ role: 'r' }).size }}\n"
+          "---\n+++\nrole: r\nsize: 4\n+++\nbody\n\n```data\nsize: 9\n```\n",
+          "<h1 id=\"9\">9</h1>");
+
+    check("$.data reaches a document by index",
+          "= {{ $.data(1).who }}\n---\n+++\nwho: Uruk\n+++\n",
+          "<h1 id=\"uruk\">Uruk</h1>");
+
+    check("a number in front matter stays a number",
+          "= {{ typeof $.findOne({ n: 42 }).n }}\n---\n+++\nn: 42\n+++\n",
+          "<h1 id=\"number\">number</h1>");
+
+    check("the body text is not in the database",
+          "= {{ JSON.stringify($.findOne({ role: 'r' })).includes('secret') ? 'leaked' : 'clean' }}\n"
+          "---\n+++\nrole: r\n+++\nthe secret body\n",
+          "<h1 id=\"clean\">clean</h1>");
 
     printf("--- engine: transform, the tree through lamassu and back ---\n");
 
@@ -179,7 +263,8 @@ int main(void) {
          * one asks for an index that genuinely is not there. */
         mdy_engine *e = mdy_engine_new();
         char err[256];
-        char *html = mdy_engine_render(e, "= One", 5, 5, err, sizeof err);
+        mdy_engine_open(e, "= One", 5, err, sizeof err);
+        char *html = mdy_engine_render(e, 5, err, sizeof err);
         int ok = !html && strstr(err, "no document at index") != NULL;
         printf("  %s  a document index that is not there\n", ok ? "ok  " : "FAIL");
         if (!ok) { printf("      actual %s\n", html ? html : err); failures++; }

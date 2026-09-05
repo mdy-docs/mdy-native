@@ -260,9 +260,10 @@ check-ingest: build/ingest-test$(EXE)
 
 # One document, end to end, with no JavaScript engine but lamassu — the three
 # passes of src/mdy.js done in C. QuickJS is not linked into this binary.
-build/engine-test$(EXE): test/engine.c src/engine.c $(LAM_LIBS) $(PARSE_LIB)
+build/engine-test$(EXE): test/engine.c src/engine.c src/ingest.c src/nis.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Isrc $(PARSE_INC) test/engine.c src/engine.c \
+	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(NIS_RENAME) \
+	  test/engine.c src/engine.c src/ingest.c src/nis.c $(NIS_SRCS) \
 	  $(PARSE_LIB) $(LAM_LIBS) -o $@ $(LDLIBS)
 
 check-engine: build/engine-test$(EXE)
