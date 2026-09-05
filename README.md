@@ -482,9 +482,13 @@ largest single thing in it.
 
 ```
 corpus, 93 pages          JS front end   C front end
-                              62.5 s        48.1 s
-bundle                        1.6 mb        1.5 mb
+                              61.0 s        45.5 s
+bundle                        1.62 mb       1.48 mb
 ```
+
+Measured back to back on the same machine, both bundles from the same
+sources — `MDY_PARSER=js|c node scripts-build.mjs site`. The two outputs agree
+byte for byte.
 
 The comparison that matters is not the clock, though — it is that the output
 does not move. All 93 pages are **byte-identical** to what `node bin/mdy.js
@@ -529,10 +533,13 @@ YAML reader and there is no case for writing a second one in C — and the
 
 `shims/parse.js` reads the YAML, applies mdy-docs' own highlighter to the
 finished tree, and puts the warnings on the vfile. Highlighting after the parse
-rather than inside it is why lowlight is back in the bundle, and why the corpus
-build is 48.1 s rather than the 42.1 s it measured while producing
-unhighlighted code blocks. That is the right way round: the earlier number was
-faster because it was doing less.
+rather than inside it is why lowlight is in the bundle at all — 328 KB of
+grammars, which is most of the difference between the two bundle sizes above.
+
+It costs nothing to run here: `normalizeHighlight` totals **2 ms over 428
+calls** across the corpus, because the corpus has no fenced code. An earlier
+note in this file blamed a slower build on highlighting; that was wrong, and
+the numbers above replace it.
 
 Which front end a bundle gets is a choice. The application entries take the C
 one; the `tests` entry does not, so `make test` measures **mdy-docs'** behaviour
