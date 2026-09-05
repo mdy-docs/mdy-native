@@ -617,11 +617,27 @@ checked against `node bin/mdy.js build` on the same source rather than against
 what it looked like it should do — twice that disagreed with the expectation
 written here first, and node was right both times.
 
-`$.resize` is the exception, and it is a DEPENDENCY rather than a port: it
-needs JPEG and PNG codecs. It refuses by name, as everything did before —
-`$.resize is not implemented in the C engine yet` — because a stub returning
-undefined produces a page quietly missing whatever the document asked for,
-which is the failure this project has been most careful to avoid.
+`$.resize` works too, over stb (third_party/stb) — decode, resample, encode,
+three vendored headers and no platform binary to prebuild, which is the same
+reason lamassu and nisaba are here as source. PNG only, which is parity rather
+than a shortfall: mdy-docs' own CODECS table holds one entry, because
+@jsquash's JPEG codec has a different init shape and was never wired.
+
+**It is the one place this port does not produce the same bytes.** mdy-docs
+resizes with Squoosh's codecs; this uses a different resampler and a different
+encoder, so the same request gives a visually equivalent image and a different
+file. Measured against the JavaScript on a deliberately harsh test pattern, the
+decoded pixels differ by a mean of 1.3–3.6 out of 255. Every other observable
+matches exactly — the output path, the URL, the derived dimension, the
+memoisation, and each error message.
+
+There is one more divergence, in reading an image's DIMENSIONS. mdy-docs uses
+the `image-size` package and hands it a `Uint8Array`; for at least some TIFFs
+that throws where the same bytes as a `Buffer` do not, so the record comes back
+with no width or height. This reads the header itself and gets the size. Being
+bug-compatible with a third-party library's buffer handling is not worth it,
+so this one is deliberate — but it is a difference, and a site laying out a
+TIFF would see it.
 
 Two of them are worth knowing about because their shape is not the obvious one:
 

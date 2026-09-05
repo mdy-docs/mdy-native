@@ -20,7 +20,7 @@
 #include "engine.h"
 #include "fsx.h"
 
-typedef struct { const char *out; int count; int failed; int messages; } Sink;
+typedef struct { const char *out; int count; int failed; int messages; int images; } Sink;
 
 static void write_page(void *ud, const char *path, const char *content) {
     Sink *s = ud;
@@ -30,6 +30,17 @@ static void write_page(void *ud, const char *path, const char *content) {
         return;
     }
     s->count++;
+}
+
+/* A resized image: bytes rather than text, but the same idea as a page. */
+static void write_image(void *ud, const char *path, const uint8_t *bytes, size_t len) {
+    Sink *s = ud;
+    if (fsx_write(s->out, path, bytes, len) != 0) {
+        fprintf(stderr, "cannot write %s/%s\n", s->out, path);
+        s->failed++;
+        return;
+    }
+    s->images++;
 }
 
 /*
@@ -101,9 +112,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    Sink sink = { out, 0, 0, 0 };
+    Sink sink = { out, 0, 0, 0, 0 };
     mdy_engine_on_emit(e, write_page, &sink);
     mdy_engine_on_publish(e, note_message, &sink);
+    mdy_engine_on_binary(e, write_image, &sink);
 
     char *html = mdy_engine_render(e, (size_t)at, err, sizeof err);
     if (!html) {
@@ -122,6 +134,7 @@ int main(int argc, char **argv) {
     if (!quiet) {
         printf("built %d page(s)%s -> %s\n", sink.count,
                assets ? " and copied static/" : "", out);
+        if (sink.images) printf("%d resized image(s)\n", sink.images);
         if (sink.messages)
             printf("%d message(s) not sent - this embedder builds a site, "
                    "it has no broker\n", sink.messages);

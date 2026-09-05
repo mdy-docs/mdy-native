@@ -129,13 +129,22 @@ static void site_checks(void) {
         "% $.emit('notes.txt', notes.body)\n"
         "% const conf = $.findOne({ path: 'site.yaml' })\n"
         "% $.emit('title.txt', conf.title)\n"
+        /*
+         * A data file's OWN fields win over the identity the walk derived —
+         * identity is a default there, not an override. A record commonly
+         * declares a `name` or a `size` of its own, and shadowing those would
+         * make the file's data unreachable under the field it actually used.
+         * `path` is the exception: everything resolves documents by it, so it
+         * is always the real one.
+         */
+        "% $.emit('own.txt', [conf.name, conf.size, conf.ext, conf.path].join('|'))\n"
         "% $.emit('tags.txt', (notes.tags || []).join(','))\n"
         "% $.emit('words.txt', $.tokenize('The Walls of Uruk and the walls').join(','))\n"
         "% $.emit('date.txt', $.rfc822('2026-09-05'))\n");
     write_file(root, "layout.mdy", "= {{ req.who }}\n");
     write_file(root, "cities/uruk.yaml", "role: city\nwho: Uruk\nslug: uruk\n");
     write_file(root, "cities/babylon.yaml", "role: city\nwho: Babylon\nslug: babylon\n");
-    write_file(root, "site.yaml", "title: A Directory\n");
+    write_file(root, "site.yaml", "title: A Directory\nname: Not The File Name\nsize: enormous\n");
     write_file(root, "notes.md",
         "A {{ literal }} in prose. #uruk and #Uruk again.\n"
         "\n"
@@ -182,6 +191,11 @@ static void site_checks(void) {
         uruk && strcmp(uruk, "<h1 id=\"uruk\">Uruk</h1>") == 0, uruk);
     ok_("...and so is every other one",
         emitted("babylon/index.html") != NULL, NULL);
+    ok_("a data file's own fields beat the identity the walk derived",
+        emitted("own.txt") &&
+            strcmp(emitted("own.txt"),
+                   "Not The File Name|enormous|.yaml|site.yaml") == 0,
+        emitted("own.txt"));
     ok_("a data file's own field is readable",
         emitted("title.txt") && strcmp(emitted("title.txt"), "A Directory") == 0,
         emitted("title.txt"));
@@ -414,6 +428,198 @@ static void natives_checks(void) {
             "% $.publish('static.logo', {})\n"
             "---\n+++\npath: static/logo.png\next: .png\n+++\n",
             "no document is named \"static.logo\"");
+}
+
+
+/* Bytes a `$.resize` produced, for the checks below. */
+static char last_image_path[256];
+static size_t last_image_len;
+static int image_count;
+static uint8_t last_image[65536];
+
+static void collect_image(void *ud, const char *path, const uint8_t *bytes, size_t len) {
+    (void)ud;
+    snprintf(last_image_path, sizeof last_image_path, "%s", path);
+    last_image_len = len < sizeof last_image ? len : sizeof last_image;
+    memcpy(last_image, bytes, last_image_len);
+    image_count++;
+}
+
+/* A real PNG, built here rather than checked in: 4 bytes of header a decoder
+ * would reject is not a test of a decoder. */
+static void write_png(const char *root, const char *rel, int w, int h) {
+    /* Uncompressed deflate blocks, so no compressor is needed — a valid zlib
+     * stream is a 2-byte header, stored blocks, and an Adler-32. */
+    size_t raw_len = (size_t)h * (1 + (size_t)w * 4);
+    uint8_t *raw = malloc(raw_len);
+    if (!raw) return;
+    size_t at = 0;
+    for (int y = 0; y < h; y++) {
+        raw[at++] = 0;                       /* filter: none */
+        for (int x = 0; x < w; x++) {
+            raw[at++] = (uint8_t)((x * 37) & 0xFF);
+            raw[at++] = (uint8_t)((y * 53) & 0xFF);
+            raw[at++] = 128;
+            raw[at++] = 255;
+        }
+    }
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < raw_len; i++) { a = (a + raw[i]) % 65521; b = (b + a) % 65521; }
+    uint32_t adler = (b << 16) | a;
+
+    size_t z_cap = raw_len + raw_len / 65535 * 5 + 64;
+    uint8_t *z = malloc(z_cap);
+    if (!z) { free(raw); return; }
+    size_t zn = 0;
+    z[zn++] = 0x78; z[zn++] = 0x01;
+    size_t left = raw_len, off = 0;
+    while (left > 0 || raw_len == 0) {
+        uint16_t chunk = left > 65535 ? 65535 : (uint16_t)left;
+        z[zn++] = (uint8_t)((left <= 65535) ? 1 : 0);
+        z[zn++] = (uint8_t)(chunk & 0xFF);
+        z[zn++] = (uint8_t)(chunk >> 8);
+        z[zn++] = (uint8_t)(~chunk & 0xFF);
+        z[zn++] = (uint8_t)((~chunk >> 8) & 0xFF);
+        memcpy(z + zn, raw + off, chunk);
+        zn += chunk; off += chunk; left -= chunk;
+        if (left == 0) break;
+    }
+    z[zn++] = (uint8_t)(adler >> 24); z[zn++] = (uint8_t)(adler >> 16);
+    z[zn++] = (uint8_t)(adler >> 8);  z[zn++] = (uint8_t)adler;
+
+    static const uint32_t CRC_POLY = 0xEDB88320u;
+    uint32_t table[256];
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? (CRC_POLY ^ (c >> 1)) : (c >> 1);
+        table[i] = c;
+    }
+    uint8_t *png = malloc(zn + 128);
+    if (!png) { free(raw); free(z); return; }
+    size_t pn = 0;
+    memcpy(png + pn, "\x89PNG\r\n\x1a\n", 8); pn += 8;
+    /* One chunk: length, type, payload, CRC over type+payload. */
+    #define PUT_CHUNK(type, payload, plen) do { \
+        uint32_t L = (uint32_t)(plen); \
+        png[pn++] = (uint8_t)(L >> 24); png[pn++] = (uint8_t)(L >> 16); \
+        png[pn++] = (uint8_t)(L >> 8);  png[pn++] = (uint8_t)L; \
+        size_t cs = pn; \
+        memcpy(png + pn, (type), 4); pn += 4; \
+        if (plen) memcpy(png + pn, (payload), (plen)); \
+        pn += (plen); \
+        uint32_t c = 0xFFFFFFFFu; \
+        for (size_t i = cs; i < pn; i++) c = table[(c ^ png[i]) & 0xFF] ^ (c >> 8); \
+        c ^= 0xFFFFFFFFu; \
+        png[pn++] = (uint8_t)(c >> 24); png[pn++] = (uint8_t)(c >> 16); \
+        png[pn++] = (uint8_t)(c >> 8);  png[pn++] = (uint8_t)c; \
+    } while (0)
+    uint8_t ihdr[13] = {
+        (uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+        (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h,
+        8, 6, 0, 0, 0,
+    };
+    PUT_CHUNK("IHDR", ihdr, 13);
+    PUT_CHUNK("IDAT", z, zn);
+    PUT_CHUNK("IEND", NULL, 0);
+    #undef PUT_CHUNK
+
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s", root, rel);
+    char *slash = strrchr(path, '/');
+    if (slash) { *slash = '\0'; fsx_mkdirp(path); *slash = '/'; }
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(png, 1, pn, f); fclose(f); }
+    free(raw); free(z); free(png);
+}
+
+static void resize_checks(void) {
+    printf("\n--- engine: $.resize ---\n");
+
+    char *tmp = fsx_tmpdir();
+    char prefix[1024];
+    snprintf(prefix, sizeof prefix, "%s/mdy-resize", tmp ? tmp : ".");
+    free(tmp);
+    char *root = fsx_mkdtemp(prefix);
+    if (!root) { printf("  FAIL  cannot make a temp directory\n"); failures++; return; }
+
+    write_png(root, "static/logo.png", 64, 40);
+    write_file(root, "notes.md", "not an image\n");
+    write_file(root, "main.mdy",
+        "% const logo = $.findOne({ path: 'static/logo.png' })\n"
+        "% $.emit('dims.txt', logo.width + 'x' + logo.height)\n"
+        "% const a = $.resize(logo, { width: 20 })\n"
+        "% $.emit('a.txt', [a.path, a.url, a.width, a.height].join('|'))\n"
+        "% const b = $.resize(logo, { height: 10 })\n"
+        "% $.emit('b.txt', [b.path, b.url, b.width, b.height].join('|'))\n"
+        "% const again = $.resize(logo, { width: 20 })\n"
+        "% $.emit('memo.txt', String(again.path === a.path))\n");
+
+    mdy_engine *e = mdy_engine_new();
+    char err[512];
+    emit_count = 0;
+    image_count = 0;
+    last_image_path[0] = '\0';
+    mdy_engine_on_emit(e, collect_all, NULL);
+    mdy_engine_on_binary(e, collect_image, NULL);
+
+    char *html = NULL;
+    if (mdy_engine_open_dir(e, root, err, sizeof err) == 0) {
+        int at = mdy_engine_entry(e, "main.mdy");
+        if (at >= 0) html = mdy_engine_render(e, (size_t)at, err, sizeof err);
+    }
+    if (!html) {
+        printf("  FAIL  the entry renders\n      %s\n", err);
+        failures++;
+        mdy_engine_free(e);
+        fsx_rm_rf(root);
+        free(root);
+        return;
+    }
+    free(html);
+
+    /* An image's dimensions are read from its header during the walk — a
+     * record without them cannot be resized at all. */
+    ok_("an image file's record carries its dimensions",
+        emitted("dims.txt") && strcmp(emitted("dims.txt"), "64x40") == 0,
+        emitted("dims.txt"));
+
+    /*
+     * The output path is DIST-relative: `static/` is stripped, because a build
+     * copies static/'s contents to the output root and a resized file has to
+     * land in the same flattened space or its URL would not match.
+     */
+    ok_("a resize names where it landed, with static/ flattened away",
+        emitted("a.txt") && strcmp(emitted("a.txt"),
+                                   "logo-20x13.png|/logo-20x13.png|20|13") == 0,
+        emitted("a.txt"));
+    ok_("...deriving the other side from the aspect ratio",
+        emitted("b.txt") && strcmp(emitted("b.txt"),
+                                   "logo-16x10.png|/logo-16x10.png|16|10") == 0,
+        emitted("b.txt"));
+    ok_("...and asking twice decodes once",
+        emitted("memo.txt") && strcmp(emitted("memo.txt"), "true") == 0 && image_count == 2,
+        emitted("memo.txt"));
+
+    /* The bytes are a real PNG of the size asked for — checked by reading the
+     * header back, because "it wrote something" is not the claim. */
+    int ok_png = last_image_len > 24 &&
+                 memcmp(last_image, "\x89PNG\r\n\x1a\n", 8) == 0;
+    int w = 0, h = 0;
+    if (ok_png) {
+        w = (int)((last_image[16] << 24) | (last_image[17] << 16) |
+                  (last_image[18] << 8) | last_image[19]);
+        h = (int)((last_image[20] << 24) | (last_image[21] << 16) |
+                  (last_image[22] << 8) | last_image[23]);
+    }
+    char detail[128];
+    snprintf(detail, sizeof detail, "%s %dx%d (%zu bytes)",
+             last_image_path, w, h, last_image_len);
+    ok_("...and the bytes really are a PNG of that size",
+        ok_png && w == 16 && h == 10, detail);
+
+    mdy_engine_free(e);
+    fsx_rm_rf(root);
+    free(root);
 }
 
 int main(void) {
@@ -770,10 +976,11 @@ int main(void) {
             "%% transform(() => 42)\n= x", "transform must return a hast node");
 
     printf("--- engine: what it refuses, loudly ---\n");
-    /* `$.resize` is the one native left, and it is left on purpose: it needs
-     * JPEG and PNG codecs, which is a dependency rather than a port. */
-    refuses("a native that is still not implemented",
-            "{{ $.resize({}, {}) }}", "$.resize is not implemented");
+    /* Nothing refuses any more — every native mdy-docs documents is here.
+     * What is left to check is that each one says clearly what it wanted. */
+    refuses("$.resize wants a file document",
+            "{{ $.resize('nope', {}) }}",
+            "expected a file document (path/ext, from $.find/$.findOne)");
     refuses("a render of a document that is not there",
             "{{ $.render({ role: 'nowhere' }) }}", "found no such document");
     refuses("code that does not compile", "% const = \n= x", "did not compile");
@@ -794,6 +1001,7 @@ int main(void) {
 
     site_checks();
     natives_checks();
+    resize_checks();
     gc_checks();
 
     if (failures) { printf("\n%d failed\n", failures); return 1; }

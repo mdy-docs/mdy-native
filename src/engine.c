@@ -1,6 +1,7 @@
 /* The contract, and what is not here yet, is in engine.h. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 #include "lamassu.h"
@@ -18,6 +19,7 @@
 #include "ingest.h"
 
 #include "mdybuild.h"
+#include "images.h"
 #include "mdymarkdown.h"
 #include "mdyscript.h"
 #include "mdytext.h"
@@ -31,6 +33,8 @@
  * below the contents list writes.
  */
 typedef struct { char id[24]; mdy_doc *doc; mdy_node *tree; int is_toc; } Held;
+
+typedef struct Resized Resized;
 
 /* One document of an open set. Its TEXT is here; its DATA is in nisaba. */
 typedef struct {
@@ -97,6 +101,12 @@ struct mdy_engine {
     void *on_emit_ud;
     void (*on_publish)(void *ud, const char *name, const char *data_json, size_t doc_index);
     void *on_publish_ud;
+    void (*on_binary)(void *ud, const char *path, const uint8_t *bytes, size_t len);
+    void *on_binary_ud;
+    /* Resizes already made, on the graph's token table so a theme and the site
+     * that imported it do not each make their own copy. */
+    Resized *resized;
+    size_t resized_count;
     /* `_id` to index, in insertion order, so a hit maps back to its document. */
     uint8_t (*ids)[12];
 
@@ -122,7 +132,24 @@ struct mdy_engine {
      * the same name, which is the rule mdy-docs states — a document's `name`
      * is its file's, never its front matter's.
      */
-    char **identity;
+    /*
+     * Identity is merged in a DIFFERENT PLACE depending on the kind of file,
+     * because the rule differs:
+     *
+     *   .mdy/.md    identity WINS. A document's `name` is its file's, never a
+     *               front-matter field of the same name.
+     *   .yaml       identity is a DEFAULT. A data record commonly declares its
+     *               own `name` or `size` — Ada Lovelace's name, a product's
+     *               size — and identity shadowing those would make the file's
+     *               own data unreachable under the field it actually used.
+     *               Only `path` is structurally required to be real, because
+     *               everything resolves documents by it.
+     *
+     * So `ident_pre` goes in before the document's own fields and `ident_post`
+     * after: one is set for a data file, the other for everything else.
+     */
+    char **ident_pre;
+    char **ident_post;
     size_t identity_count;
 
     char *root;
@@ -916,6 +943,29 @@ static const char *extension_of(const char *name) {
     return (!dot || dot == name) ? "" : dot;
 }
 
+/* The extensions mdy-docs reads dimensions for. A record carrying width and
+ * height is what lets a template lay a page out without opening the file, and
+ * `$.resize` refuses without them. */
+static int is_image_ext(const char *ext) {
+    static const char *const EXTS[] = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+        ".svg", ".avif", ".ico", ".tiff", ".tif",
+    };
+    for (size_t i = 0; i < sizeof EXTS / sizeof *EXTS; i++) {
+        size_t n = strlen(EXTS[i]);
+        if (strlen(ext) != n) continue;
+        size_t k = 0;
+        while (k < n) {
+            char a = ext[k], b = EXTS[i][k];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (a != b) break;
+            k++;
+        }
+        if (k == n) return 1;
+    }
+    return 0;
+}
+
 static int ends_with_ci(const char *s, const char *suffix) {
     size_t n = strlen(s), m = strlen(suffix);
     if (m > n) return 0;
@@ -1372,8 +1422,9 @@ static int open_dir_inner(mdy_engine *e, const char *root, ImportCache *cache,
         int is_md = ends_with_ci(rel, ".md");
         int is_yaml = ends_with_ci(rel, ".yaml") || ends_with_ci(rel, ".yml");
 
+        int is_image = is_image_ext(ext);
         uint8_t *bytes = NULL;
-        if (is_mdy || is_md || is_yaml) bytes = fsx_read(root, rel, &body_len);
+        if (is_mdy || is_md || is_yaml || is_image) bytes = fsx_read(root, rel, &body_len);
 
         /*
          * The record. `path` is written LAST of the identity fields for the
@@ -1389,6 +1440,18 @@ static int open_dir_inner(mdy_engine *e, const char *root, ImportCache *cache,
         int ident_len = snprintf(ident, sizeof ident,
             "name: \"%s\"\next: \"%s\"\nsize: %.0f\nmtime: %.0f\npath: \"%s\"\n",
             name, ext, size, mtime, rel);
+        /*
+         * A picture's dimensions, read from its header. Not decodable —
+         * corrupt, truncated, a variant this does not know — is not an error:
+         * it is still a real file and still gets its record, just without
+         * width and height.
+         */
+        if (is_image && bytes) {
+            int iw = 0, ih = 0;
+            if (mdy_image_size(bytes, body_len, &iw, &ih) == 0 && ident_len > 0)
+                ident_len += snprintf(ident + ident_len, sizeof ident - (size_t)ident_len,
+                                      "width: %d\nheight: %d\n", iw, ih);
+        }
         (void)ident_len;
 
         size_t need = len + (size_t)head_len + body_len + 4096;
@@ -1470,10 +1533,22 @@ static int open_dir_inner(mdy_engine *e, const char *root, ImportCache *cache,
 
         /* One identity per document this file became. */
         for (size_t k = 0; k < doc_count; k++) {
-            char **grown = realloc(e->identity, (e->identity_count + 1) * sizeof *grown);
-            if (!grown) break;
-            e->identity = grown;
-            e->identity[e->identity_count++] = strdup(ident);
+            char **pre = realloc(e->ident_pre, (e->identity_count + 1) * sizeof *pre);
+            char **post = realloc(e->ident_post, (e->identity_count + 1) * sizeof *post);
+            if (pre) e->ident_pre = pre;
+            if (post) e->ident_post = post;
+            if (!pre || !post) break;
+            if (is_yaml) {
+                /* A default: the file's own fields win, except `path`. */
+                char only_path[2048];
+                snprintf(only_path, sizeof only_path, "path: \"%s\"\n", rel);
+                e->ident_pre[e->identity_count] = strdup(ident);
+                e->ident_post[e->identity_count] = strdup(only_path);
+            } else {
+                e->ident_pre[e->identity_count] = NULL;
+                e->ident_post[e->identity_count] = strdup(ident);
+            }
+            e->identity_count++;
         }
         free(bytes);
     }
@@ -1517,6 +1592,8 @@ static int open_dir_inner(mdy_engine *e, const char *root, ImportCache *cache,
         child->on_emit_ud = e->on_emit_ud;
         child->on_publish = e->on_publish;
         child->on_publish_ud = e->on_publish_ud;
+        child->on_binary = e->on_binary;
+        child->on_binary_ud = e->on_binary_ud;
         child->tokens = token_table(e);
         /* In the cache before it is built, so a package that imports itself
          * through a diamond finds the one in progress rather than starting a
@@ -2047,12 +2124,18 @@ int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
         if (d->matter.len) matter = mdy_yaml_parse(d->matter.text, d->matter.len, err, sizeof err);
 
         size_t fence_count = d->fences ? mdy_data_count(d->fences) : 0;
-        /* front matter + every data fence + file identity */
-        const mdy_yaml_node **maps = calloc(fence_count + 2, sizeof *maps);
+        /* identity-as-default + front matter + every data fence + identity */
+        const mdy_yaml_node **maps = calloc(fence_count + 3, sizeof *maps);
         mdy_yaml **parsed = calloc(fence_count + 1, sizeof *parsed);
         if (!maps || !parsed) { free(maps); free(parsed); mdy_yaml_free(matter); close_set(e); return -1; }
 
         size_t used = 0;
+        /* Before the document's own fields, where identity is a DEFAULT. */
+        mdy_yaml *pre = NULL;
+        if (e->ident_pre && i < e->identity_count && e->ident_pre[i]) {
+            pre = mdy_yaml_parse(e->ident_pre[i], strlen(e->ident_pre[i]), err, sizeof err);
+            if (pre) maps[used++] = mdy_yaml_root(pre);
+        }
         if (matter) maps[used++] = mdy_yaml_root(matter);
         for (size_t f = 0; f < fence_count; f++) {
             const mdy_data_fence *fence = mdy_data_at(d->fences, f);
@@ -2062,15 +2145,13 @@ int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
             maps[used++] = mdy_yaml_root(y);
         }
 
-        /*
-         * File identity goes in LAST, so it wins: a document's `name` is its
-         * file's, never a field of the same name in its front matter. `path`
-         * especially — everything resolves documents by it.
-         */
-        mdy_yaml *ident = NULL;
-        if (e->identity && i < e->identity_count && e->identity[i]) {
-            ident = mdy_yaml_parse(e->identity[i], strlen(e->identity[i]), err, sizeof err);
-            if (ident) maps[used++] = mdy_yaml_root(ident);
+
+        /* After them, where identity WINS — and, for a data file, the one
+         * field that must be real whatever it declared. */
+        mdy_yaml *post = NULL;
+        if (e->ident_post && i < e->identity_count && e->ident_post[i]) {
+            post = mdy_yaml_parse(e->ident_post[i], strlen(e->ident_post[i]), err, sizeof err);
+            if (post) maps[used++] = mdy_yaml_root(post);
         }
 
         mdy_oid_next(d->oid);
@@ -2085,7 +2166,8 @@ int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
         }
         bj_builder_free(b);
         mdy_yaml_free(matter);
-        mdy_yaml_free(ident);
+        mdy_yaml_free(pre);
+        mdy_yaml_free(post);
         for (size_t f = 0; f < fence_count; f++) mdy_yaml_free(parsed[f]);
         free(maps);
         free(parsed);
@@ -2117,6 +2199,14 @@ void mdy_engine_on_publish(mdy_engine *e,
                            void *ud) {
     e->on_publish = fn;
     e->on_publish_ud = ud;
+}
+
+void mdy_engine_on_binary(mdy_engine *e,
+                          void (*fn)(void *ud, const char *path,
+                                     const uint8_t *bytes, size_t len),
+                          void *ud) {
+    e->on_binary = fn;
+    e->on_binary_ud = ud;
 }
 
 /* ---- querying ---------------------------------------------------------------
@@ -2263,32 +2353,6 @@ static bool data_native(JsContext *ctx, JsValue this_val, const JsValue *args,
     return true;
 }
 
-/* ---- `$`, with every native refusing ---------------------------------------
- *
- * A native that is not implemented THROWS, naming itself. The alternative — a
- * stub returning undefined — produces a page that is quietly missing whatever
- * the document asked for, which is the failure this whole project has been
- * most careful to avoid.
- */
-static bool refuse(JsContext *ctx, JsValue this_val, const JsValue *args, int argc,
-                   JsValue *result) {
-    (void)this_val;
-    JsVm *vm = js_context_vm(ctx);
-    char msg[160];
-    char name[64] = "(unnamed)";
-    if (argc > 0 && js_is_string(args[0])) {
-        size_t ulen = 0;
-        const uint16_t *u = js_string_units(args[0], &ulen);
-        size_t n = 0;
-        for (size_t i = 0; i < ulen && n < sizeof name - 1; i++)
-            if (u[i] < 0x80) name[n++] = (char)u[i];
-        name[n] = '\0';
-    }
-    snprintf(msg, sizeof msg,
-             "mdy-engine: $.%s is not implemented in the C engine yet", name);
-    *result = str(vm, msg, strlen(msg));
-    return false;
-}
 
 /*
  * `$.compose(__out)` — the one native step 2 implements, and the reason the
@@ -3124,8 +3188,204 @@ static bool publish_native(JsContext *ctx, JsValue this_val, const JsValue *args
     return true;
 }
 
+
+/* ---- $.resize ----------------------------------------------------------------
+ *
+ * A document asks for a smaller copy of an image and gets back where to find
+ * it:
+ *
+ *   % const logo = $.findOne({ path: 'static/logo.png' })
+ *   % const thumb = $.resize(logo, { width: 200 })
+ *   <img src="{{ thumb.url }}" width="{{ thumb.width }}" height="{{ thumb.height }}">
+ *
+ * The resized image is a BUILD OUTPUT and is never written back into the
+ * site's own static/ — it reaches the embedder through the binary-output
+ * callback, the same way `$.emit` reaches it with a page. Its path is
+ * DIST-relative rather than site-relative: a source under static/ has that
+ * prefix stripped, because a build copies static/'s contents straight to the
+ * output root and a resized file has to land in the same flattened space or
+ * its URL would not match how every other asset is served.
+ *
+ * PNG only. That is parity, not a shortfall: mdy-docs' own CODECS table holds
+ * one entry, because @jsquash's JPEG codec has a different init shape and was
+ * never wired up.
+ *
+ * The BYTES will not match mdy-docs'. It resizes with Squoosh's codecs and
+ * this uses stb — a different resampler and a different encoder, so the same
+ * request gives a visually equivalent image with a different file. It is the
+ * one place in this port where output is not byte-for-byte the JavaScript's,
+ * and it is stated wherever resize is documented rather than discovered.
+ */
+
+static const char *STATIC_PREFIX = "static/";
+
+/* A resize already done, so the same request does not decode twice. */
+struct Resized {
+    char *path;
+    int width, height;
+};
+
+static bool resize_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                          int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    char msg[768];
+
+#define RESIZE_FAIL(...) do { \
+        snprintf(msg, sizeof msg, __VA_ARGS__); \
+        *result = str(e->vm, msg, strlen(msg)); \
+        return false; \
+    } while (0)
+
+    JsValue doc = argc > 0 ? args[0] : js_undefined();
+    /* `JSON.stringify` of an undefined value is undefined, not a string —
+     * which concatenates as "undefined", so that is what is printed. */
+    char *shown = argc > 2 ? js_string_utf8(args[2]) : NULL;
+    const char *got = shown ? shown : "undefined";
+
+    char *path = js_is_object(doc)
+        ? js_string_utf8(js_object_get(e->vm, doc, key(e->vm, "path"))) : NULL;
+    char *ext = js_is_object(doc)
+        ? js_string_utf8(js_object_get(e->vm, doc, key(e->vm, "ext"))) : NULL;
+    if (!path || !ext) {
+        snprintf(msg, sizeof msg,
+                 "resize: expected a file document (path/ext, from $.find/$.findOne), not %s",
+                 got);
+        free(path); free(ext); free(shown);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+
+    char lower[64];
+    snprintf(lower, sizeof lower, "%s", ext);
+    for (char *p = lower; *p; p++) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+    if (strcmp(lower, ".png") != 0) {
+        snprintf(msg, sizeof msg,
+                 "resize: unsupported image type \"%s\" (supported: .png)", ext);
+        free(path); free(ext); free(shown);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+
+    JsValue vw = js_object_get(e->vm, doc, key(e->vm, "width"));
+    JsValue vh = js_object_get(e->vm, doc, key(e->vm, "height"));
+    if (!js_is_number(vw) || !js_is_number(vh)) {
+        snprintf(msg, sizeof msg,
+                 "resize: %s has no known width/height (its dimensions could not be read)",
+                 path);
+        free(path); free(ext); free(shown);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    double src_w = js_get_number(vw), src_h = js_get_number(vh);
+
+    /* At least one of width/height; the other follows from the aspect ratio. */
+    JsValue options = argc > 1 && js_is_object(args[1]) ? args[1] : js_undefined();
+    JsValue ow = js_is_object(options) ? js_object_get(e->vm, options, key(e->vm, "width"))
+                                       : js_undefined();
+    JsValue oh = js_is_object(options) ? js_object_get(e->vm, options, key(e->vm, "height"))
+                                       : js_undefined();
+    int has_w = js_is_number(ow), has_h = js_is_number(oh);
+    if (!has_w && !has_h) {
+        free(path); free(ext); free(shown);
+        RESIZE_FAIL("resize: pass at least one of { width, height }");
+    }
+    double want_w = has_w ? js_get_number(ow) : 0;
+    double want_h = has_h ? js_get_number(oh) : 0;
+    if (!has_w) want_w = floor((want_h / src_h) * src_w + 0.5);
+    if (!has_h) want_h = floor((want_w / src_w) * src_h + 0.5);
+    int width = (int)floor(want_w + 0.5);
+    int height = (int)floor(want_h + 0.5);
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+
+    /* Where it lands: dist-relative, with static/ flattened away. */
+    size_t plen = strlen(path), elen = strlen(ext);
+    size_t stem_len = plen >= elen ? plen - elen : plen;
+    const char *stem = path;
+    if (stem_len >= strlen(STATIC_PREFIX) &&
+        strncmp(path, STATIC_PREFIX, strlen(STATIC_PREFIX)) == 0) {
+        stem += strlen(STATIC_PREFIX);
+        stem_len -= strlen(STATIC_PREFIX);
+    }
+    char out_path[1024];
+    snprintf(out_path, sizeof out_path, "%.*s-%dx%d%s",
+             (int)stem_len, stem, width, height, ext);
+
+    /* Already done? The same request must not decode the file twice. */
+    mdy_engine *t = token_table(e);
+    for (size_t i = 0; i < t->resized_count; i++) {
+        if (strcmp(t->resized[i].path, out_path) == 0) {
+            free(path); free(ext); free(shown);
+            JsValue r = js_object_new(e->ctx);
+            js_gc_protect(e->vm, &r);
+            set_val(e, r, "path", str(e->vm, out_path, strlen(out_path)));
+            char url[1100];
+            int n = snprintf(url, sizeof url, "/%s", out_path);
+            set_val(e, r, "url", str(e->vm, url, (size_t)n));
+            set_val(e, r, "width", js_number(t->resized[i].width));
+            set_val(e, r, "height", js_number(t->resized[i].height));
+            js_gc_unprotect(e->vm, &r);
+            *result = r;
+            return true;
+        }
+    }
+
+    if (!e->root) {
+        free(path); free(ext); free(shown);
+        RESIZE_FAIL("resize: this document set was not opened from a directory, "
+                    "so there is no file to read");
+    }
+
+    size_t len = 0;
+    uint8_t *bytes = fsx_read(e->root, path, &len);
+    if (!bytes) {
+        snprintf(msg, sizeof msg, "resize: cannot read %s", path);
+        free(path); free(ext); free(shown);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+
+    size_t out_len = 0;
+    uint8_t *made = mdy_image_resize_png(bytes, len, width, height, &out_len);
+    free(bytes);
+    if (!made) {
+        snprintf(msg, sizeof msg, "resize: %s could not be decoded as a PNG", path);
+        free(path); free(ext); free(shown);
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+
+    if (e->on_binary) e->on_binary(e->on_binary_ud, out_path, made, out_len);
+    free(made);
+
+    /* Remembered on the token table, which the whole import graph shares — a
+     * theme and the site that imported it must not each make their own copy. */
+    Resized *grown = realloc(t->resized, (t->resized_count + 1) * sizeof *grown);
+    if (grown) {
+        t->resized = grown;
+        t->resized[t->resized_count].path = strdup(out_path);
+        t->resized[t->resized_count].width = width;
+        t->resized[t->resized_count].height = height;
+        t->resized_count++;
+    }
+    free(path); free(ext); free(shown);
+
+    JsValue r = js_object_new(e->ctx);
+    js_gc_protect(e->vm, &r);
+    set_val(e, r, "path", str(e->vm, out_path, strlen(out_path)));
+    char url[1100];
+    int n = snprintf(url, sizeof url, "/%s", out_path);
+    set_val(e, r, "url", str(e->vm, url, (size_t)n));
+    set_val(e, r, "width", js_number(width));
+    set_val(e, r, "height", js_number(height));
+    js_gc_unprotect(e->vm, &r);
+    *result = r;
+    return true;
+#undef RESIZE_FAIL
+}
+
 static void register_natives(mdy_engine *e) {
-    register_one(e, "__native", refuse);
     register_one(e, "__compose", compose_native);
     register_one(e, "__find", find_native);
     register_one(e, "__findOne", find_one_native);
@@ -3145,6 +3405,7 @@ static void register_natives(mdy_engine *e) {
     register_one(e, "__table", table_native);
     register_one(e, "__toc", toc_native);
     register_one(e, "__publish", publish_native);
+    register_one(e, "__resize", resize_native);
 }
 
 /*
@@ -3223,8 +3484,14 @@ void mdy_engine_free(mdy_engine *e) {
         free(e->imports[i].spec);
     }
     free(e->imports);
-    for (size_t i = 0; i < e->identity_count; i++) free(e->identity[i]);
-    free(e->identity);
+    for (size_t i = 0; i < e->identity_count; i++) {
+        if (e->ident_pre) free(e->ident_pre[i]);
+        if (e->ident_post) free(e->ident_post[i]);
+    }
+    free(e->ident_pre);
+    free(e->ident_post);
+    for (size_t i = 0; i < e->resized_count; i++) free(e->resized[i].path);
+    free(e->resized);
     free(e->root);
 
     close_set(e);
@@ -3243,10 +3510,9 @@ void mdy_engine_free(mdy_engine *e) {
  */
 static char *wrap(const char *statements) {
     /*
-     * Every `$` native, wired to the one global that stands behind them. They
-     * all refuse for now — see the note above `refuse` — and a document that
-     * calls one gets an error naming it rather than a page quietly missing
-     * whatever it asked for.
+     * Every `$` native. There is no longer a refusing stand-in behind any of
+     * them: the last one, `$.resize`, was the only native that needed a codec
+     * rather than a port, and it has one now.
      */
     static const char OPEN[] =
         "(async (req, res, $$) => {\n"
@@ -3261,7 +3527,10 @@ static char *wrap(const char *statements) {
         /* The one native that is a DEPENDENCY rather than a port: resizing
          * needs JPEG and PNG codecs. It refuses by name so a document that
          * asks gets told, rather than a page quietly missing a picture. */
-        "  resize: (r, o) => __native('resize', r, o),\n"
+        /* The record is stringified for the ERROR message — mdy-docs names
+         * what it was given when the shape is wrong, and a file record is a
+         * handful of fields, so the cost is nothing beside decoding a PNG. */
+        "  resize: (r, o) => __resize(r, o === undefined ? {} : o, JSON.stringify(r)),\n"
         "  parse: (s) => __parse(s),\n"
         "  markdown: (s) => __markdown(s),\n"
         "  node: (t) => __node(t),\n"
@@ -3273,7 +3542,7 @@ static char *wrap(const char *statements) {
         "  __importRender: (s, t, c) => __importRender(s, t, c),\n"
         "  __importFind: (s, q) => __importFind(s, q),\n"
         "  __importFindOne: (s, q) => __importFindOne(s, q),\n"
-        "  __importResize: (s, r, o) => __native('resize', r, o),\n"
+        "  __importResize: (s, r, o) => __resize(r, o, JSON.stringify(r)),\n"
         "  data: (i) => __data(i),\n"
         "  compose: (o) => __compose(o),\n"
         "};\n"

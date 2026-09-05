@@ -89,6 +89,17 @@ void mdy_engine_on_publish(mdy_engine *engine,
                                       const char *data_json, size_t doc_index),
                            void *ud);
 
+/*
+ * Where a `$.resize` output goes. A resized image is a BUILD OUTPUT — it is
+ * never written back into the site's own static/ — so it reaches the embedder
+ * the same way an emitted page does, except that it is bytes rather than text.
+ * `path` is dist-relative, with a source's `static/` prefix already stripped.
+ */
+void mdy_engine_on_binary(mdy_engine *engine,
+                          void (*fn)(void *ud, const char *path,
+                                     const uint8_t *bytes, size_t len),
+                          void *ud);
+
 /* How many documents the open set holds. */
 size_t mdy_engine_count(mdy_engine *engine);
 

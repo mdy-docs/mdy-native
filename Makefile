@@ -145,6 +145,9 @@ PARSE     := third_party/parse
 PARSE_LIB := $(PARSE)/build/libmdyast.a
 PARSE_INC := -I$(PARSE)/include -I$(PARSE)/src
 
+# stb: three single-file headers, vendored. See third_party/stb/README.md.
+STB_INC   := -Ithird_party/stb
+
 $(PARSE_LIB):
 	$(MAKE) -C $(PARSE) build/libmdyast.a
 
@@ -252,7 +255,7 @@ check-golden: build/mdy-native$(EXE) build/site.js
 # C, and it is the seam the engine will be built on.
 build/ingest-test$(EXE): test/ingest.c src/ingest.c src/nis.c $(NIS_SRCS) $(PARSE_LIB)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(NIS_RENAME) \
+	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(STB_INC) $(NIS_RENAME) \
 	  test/ingest.c src/ingest.c src/nis.c $(NIS_SRCS) $(PARSE_LIB) -o $@ $(LDFLAGS)
 
 check-ingest: build/ingest-test$(EXE)
@@ -260,26 +263,26 @@ check-ingest: build/ingest-test$(EXE)
 
 # One document, end to end, with no JavaScript engine but lamassu — the three
 # passes of src/mdy.js done in C. QuickJS is not linked into this binary.
-build/engine-test$(EXE): test/engine.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
+build/engine-test$(EXE): test/engine.c src/engine.c src/ingest.c src/nis.c src/fsx.c src/images.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(NIS_RENAME) \
-	  test/engine.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) \
+	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(STB_INC) $(NIS_RENAME) \
+	  test/engine.c src/engine.c src/ingest.c src/nis.c src/fsx.c src/images.c $(NIS_SRCS) \
 	  $(PARSE_LIB) $(LAM_LIBS) -o $@ $(LDLIBS)
 
 # The same driver under AddressSanitizer. A use-after-free in the boundary
 # between the tree, the document store and the VM is invisible without it:
 # a freed key cell is silently reused and a property becomes a different one.
-build/mdy-build-asan$(EXE): src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
+build/mdy-build-asan$(EXE): src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c src/images.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
 	@mkdir -p build
 	$(CC) -std=gnu11 -Wall -g -O1 -fsanitize=address -fno-omit-frame-pointer \
-	  -Isrc $(NIS_INC) $(PARSE_INC) $(NIS_RENAME) -I$(LAMASSU)/include \
-	  src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) \
+	  -Isrc $(NIS_INC) $(PARSE_INC) $(STB_INC) $(NIS_RENAME) -I$(LAMASSU)/include \
+	  src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c src/images.c $(NIS_SRCS) \
 	  $(PARSE_LIB) $(LAM_LIBS) -o $@ $(LDLIBS)
 
-build/mdy-build$(EXE): src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
+build/mdy-build$(EXE): src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c src/images.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(NIS_RENAME) \
-	  src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c $(NIS_SRCS) \
+	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(STB_INC) $(NIS_RENAME) \
+	  src/build_main.c src/engine.c src/ingest.c src/nis.c src/fsx.c src/images.c $(NIS_SRCS) \
 	  $(PARSE_LIB) $(LAM_LIBS) -o $@ $(LDLIBS)
 
 # Twice: once normally, once collecting at EVERY safe point.
