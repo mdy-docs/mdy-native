@@ -482,8 +482,8 @@ largest single thing in it.
 
 ```
 corpus, 93 pages          JS front end   C front end
-                              62.5 s        42.1 s
-bundle                        1.6 mb        1.1 mb
+                              62.5 s        48.1 s
+bundle                        1.6 mb        1.5 mb
 ```
 
 The comparison that matters is not the clock, though — it is that the output
@@ -491,39 +491,53 @@ does not move. All 93 pages are **byte-identical** to what `node bin/mdy.js
 build` produces, and the parse repo's own harness holds 87/87 documents,
 284,872 nodes, 20,681 positions and 10,514 URL inputs against the JavaScript.
 
-### It is a subset, and the number is measured
+### What it does not do, measured
 
-The C parser renders the corpus exactly and does **not** implement everything
-mdy-docs documents. Rather than let that be a surprise, `shims/parse.js`
-refuses an option it cannot honour — a thrown error naming the option, never a
-quiet difference in the output — and `make test-c-parser` runs mdy-docs' own
-suite against it and prints what is left:
+`make test-c-parser` runs mdy-docs' own suite against the C front end and
+prints what is left:
 
 ```
 $ make test-c-parser
-failing with the C front end: 181
+failing with the C front end: 130
     87 cannot honour `script`
     18 cannot honour `tasks`
      6 cannot honour `arrows`
      …
 ```
 
-`script` is the largest by far and the least alarming: it is the `%` and `{{ }}`
-template layer, which runs *before* block parsing, so the site path never asks
-the C parser for it. `tasks`, `arrows` and the rest are inline options a
-document can turn on and the corpus does not.
+**All 130 are refusals** — `shims/parse.js` throwing a named error for an
+option it cannot honour, never a quiet difference in the output. There are no
+remaining cases where the two front ends are asked the same question and
+answer differently. Getting there closed 54 real differences, none of which
+the reference corpus reached: comments, raw-text elements, table captions,
+the sanitize schema's `strip` list, void elements, task boxes, arrows, tab
+stops, `mailto:`, page-link tidying, front matter, warnings, and hast's
+attribute-name rules among them.
+
+`script` is the largest refusal by far and the least alarming: it is the `%`
+and `{{ }}` template layer, which runs *before* block parsing, so the site path
+never asks the C parser for it. Porting it would mean putting a JavaScript
+engine inside the parser to feed a JavaScript engine.
+
+### Where the work is divided
+
+The C parser produces more than a tree, because a front end does: it hands back
+the **warnings** it raised (a dropped `<script>` is something an author is told
+about), the **front matter** it found — as source, because YAML belongs to a
+YAML reader and there is no case for writing a second one in C — and the
+**references** a document made, its tags, mentions and page links.
+
+`shims/parse.js` reads the YAML, applies mdy-docs' own highlighter to the
+finished tree, and puts the warnings on the vfile. Highlighting after the parse
+rather than inside it is why lowlight is back in the bundle, and why the corpus
+build is 48.1 s rather than the 42.1 s it measured while producing
+unhighlighted code blocks. That is the right way round: the earlier number was
+faster because it was doing less.
 
 Which front end a bundle gets is a choice. The application entries take the C
-one; the `tests` entry does not, so `make test` measures **mdy-docs'**
-behaviour rather than this parser's subset of it, and stays at 684 passing.
+one; the `tests` entry does not, so `make test` measures **mdy-docs'** behaviour
+rather than this parser's subset of it, and stays at 684 passing.
 `MDY_PARSER=c|js` overrides either way.
-
-Four gaps have been closed this way already, each found by the suite and none
-by the corpus: `#` comments, the five raw-text elements (a layout's `<title>`
-was being wrapped in a `<p>`, which `make check-golden` caught), a fence's
-language being the first word of its info, and hast's attribute-name rules —
-which are case-insensitive for known names and verbatim for unknown ones, and
-where one name resolving differently reordered every property on an element.
 
 ## Next
 

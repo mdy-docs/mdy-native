@@ -160,18 +160,24 @@ build/mdy-native$(EXE): $(HOST_SRCS) $(HOST_HDRS) build/libquickjs.a build/libni
 
 # build/mdy.js is the bundle: mdy-docs through esbuild with the two engine
 # imports aliased to shims/. See scripts-build.mjs.
-build/mdy.js: entry.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js shims/fs.js
+# SHIMS is every shim, not the three that were listed: shims/parse.js was
+# added later and left off, so a bundle built after editing it silently kept
+# the old one — which then called the bridge with the old signature and handed
+# hast the bridge's whole result as if it were a tree.
+SHIMS := $(wildcard shims/*.js) $(wildcard shims/node/*.js)
+
+build/mdy.js: entry.mjs scripts-build.mjs $(SHIMS)
 	node scripts-build.mjs
 
-build/site.js: site-entry.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js shims/fs.js
+build/site.js: site-entry.mjs scripts-build.mjs $(SHIMS)
 	node scripts-build.mjs site
 
 # mdy-docs' own suite, bundled to run against this backend. The test files are
 # imported in place from ../../test — not copied — so they cannot drift.
-build/tests.js: tests-entry.mjs scripts-build.mjs $(wildcard shims/node/*.js) $(wildcard ../../test/*.js)
+build/tests.js: tests-entry.mjs scripts-build.mjs $(SHIMS) $(wildcard ../../test/*.js)
 	node scripts-build.mjs tests
 
-build/bench.js: bench-entry.mjs bench-body.mjs scripts-build.mjs shims/lamassu.js shims/nisaba.js
+build/bench.js: bench-entry.mjs bench-body.mjs scripts-build.mjs $(SHIMS)
 	node scripts-build.mjs bench
 
 # `make site SITE=../../examples/docs-site OUT=/tmp/out` — the CLI's own build

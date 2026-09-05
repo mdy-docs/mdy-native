@@ -1,4 +1,5 @@
 /*
+#include <stdio.h>
  * The MDY front end, in C, exposed to QuickJS.
  *
  * WHY THIS IS THE ONE WORTH MOVING. A profile of a native corpus build put
@@ -136,19 +137,75 @@ static JSValue build(JSContext *ctx, const mdy_node *n, int positions) {
 }
 
 /*
- * `__mdy_parse(text, flags, lineOffset)` -> a hast root.
+ * `__mdy_parse(text, flags, lineOffset, wrapper, fence)` ->
+ *   {tree, messages, matter, refs}
  *
- * The options that reach here are the ones that change the TREE. Everything
- * else mdy-docs' own `fromMdy` accepts either changes nothing structural or
- * belongs to a stage this does not implement — see the shim, which is where
- * that decision is written down and where an unsupported option has to be
- * noticed rather than silently ignored.
+ * More than the tree, because a front end produces more than a tree. The
+ * warnings go on the vfile, the front matter is YAML for whoever embeds this
+ * to read, and the references are what the document says it points at. Each
+ * would otherwise have to be re-derived by reading the document again.
+ *
+ * The options that reach here are the ones that change what is produced.
+ * Everything else mdy-docs' own `fromMdy` accepts belongs to a stage this does
+ * not implement — see the shim, which is where that decision is written down
+ * and where an unsupported option has to be noticed rather than ignored.
  */
 #define MDY_FLAG_DOCUMENTS   1
 #define MDY_FLAG_FRONTMATTER 2
 #define MDY_FLAG_AUTOLINK    4
 #define MDY_FLAG_POSITIONS   8
 #define MDY_FLAG_SANITIZE   16
+
+static JSValue messages_of(JSContext *ctx, const mdy_doc *doc) {
+    JSValue out = JS_NewArray(ctx);
+    for (size_t i = 0; i < mdy_message_count(doc); i++) {
+        const mdy_message *m = mdy_message_at(doc, i);
+        JSValue o = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, o, "reason", JS_NewString(ctx, m->reason));
+        JS_SetPropertyStr(ctx, o, "ruleId", JS_NewString(ctx, m->rule));
+        /* A message with no place is not one with a wrong place — the inline
+         * warnings genuinely have no line to point at. */
+        if (m->line) {
+            JSValue place = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, place, "start", point(ctx, m->line, m->column));
+            JS_SetPropertyStr(ctx, place, "end", point(ctx, m->end_line, m->end_column));
+            JS_SetPropertyStr(ctx, o, "place", place);
+        }
+        JS_SetPropertyUint32(ctx, out, (uint32_t)i, o);
+    }
+    return out;
+}
+
+static JSValue matter_of(JSContext *ctx, const mdy_doc *doc) {
+    JSValue out = JS_NewArray(ctx);
+    for (size_t i = 0; i < mdy_frontmatter_count(doc); i++) {
+        const mdy_frontmatter *m = mdy_frontmatter_at(doc, i);
+        if (!m->source) {
+            JS_SetPropertyUint32(ctx, out, (uint32_t)i, JS_NULL);
+            continue;
+        }
+        JSValue o = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, o, "source", JS_NewStringLen(ctx, m->source, m->source_len));
+        JS_SetPropertyStr(ctx, o, "open", JS_NewInt32(ctx, (int32_t)m->open_line));
+        JS_SetPropertyStr(ctx, o, "close", JS_NewInt32(ctx, (int32_t)m->close_line));
+        JS_SetPropertyUint32(ctx, out, (uint32_t)i, o);
+    }
+    return out;
+}
+
+static JSValue refs_of(JSContext *ctx, const mdy_doc *doc) {
+    static const char *const KIND[] = { "tag", "mention", "link" };
+    JSValue out = JS_NewArray(ctx);
+    for (size_t i = 0; i < mdy_reference_count(doc); i++) {
+        const mdy_reference *r = mdy_reference_at(doc, i);
+        JSValue o = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, o, "kind", JS_NewString(ctx, KIND[r->kind]));
+        JS_SetPropertyStr(ctx, o, "name", JS_NewStringLen(ctx, r->name, r->name_len));
+        JS_SetPropertyStr(ctx, o, "document", JS_NewInt32(ctx, (int32_t)r->document));
+        JS_SetPropertyUint32(ctx, out, (uint32_t)i, o);
+    }
+    return out;
+}
 
 JSValue mdy_native_parse(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
@@ -163,6 +220,15 @@ JSValue mdy_native_parse(JSContext *ctx, JSValueConst this_val, int argc, JSValu
     int32_t line_offset = 0;
     if (argc > 2) JS_ToInt32(ctx, &line_offset, argv[2]);
 
+    /* `documents: {wrapper}` — an empty string runs the documents together,
+     * which is what `wrapper: false` means on the JavaScript's side. */
+    const char *wrapper = NULL;
+    if (argc > 3 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3]))
+        wrapper = JS_ToCString(ctx, argv[3]);
+    const char *fence = NULL;
+    if (argc > 4 && !JS_IsUndefined(argv[4]) && !JS_IsNull(argv[4]))
+        fence = JS_ToCString(ctx, argv[4]);
+
     mdy_options options;
     mdy_options_default(&options);
     options.documents   = (flags & MDY_FLAG_DOCUMENTS) != 0;
@@ -171,12 +237,20 @@ JSValue mdy_native_parse(JSContext *ctx, JSValueConst this_val, int argc, JSValu
     options.positions   = (flags & MDY_FLAG_POSITIONS) != 0;
     options.sanitize    = (flags & MDY_FLAG_SANITIZE) != 0;
     options.line_offset = (uint32_t)line_offset;
+    options.document_wrapper = wrapper;
+    options.frontmatter_fence = fence;
 
     mdy_doc *doc = mdy_parse(text, len, &options);
     JS_FreeCString(ctx, text);
+    if (wrapper) JS_FreeCString(ctx, wrapper);
+    if (fence) JS_FreeCString(ctx, fence);
     if (!doc) return JS_NULL;
 
-    JSValue tree = build(ctx, mdy_root(doc), options.positions);
+    JSValue out = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, out, "tree", build(ctx, mdy_root(doc), options.positions));
+    JS_SetPropertyStr(ctx, out, "messages", messages_of(ctx, doc));
+    JS_SetPropertyStr(ctx, out, "matter", matter_of(ctx, doc));
+    JS_SetPropertyStr(ctx, out, "refs", refs_of(ctx, doc));
     mdy_free(doc);
-    return tree;
+    return out;
 }
