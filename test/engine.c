@@ -4,7 +4,7 @@
  * The whole of mdy-docs' three passes, in C: the source split into documents
  * and each into data and body, the `%` and `{{ }}` lines compiled and run in
  * lamassu, the lines they produced parsed to hast, and the tree written as
- * HTML. QuickJS is not linked into this binary at all.
+ * HTML. No JavaScript engine but lamassu is linked into this binary at all.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -848,8 +848,18 @@ int main(void) {
           "% }\n---\n= {{ req.who }}\n",
           "<h1 id=\"uruk\">Uruk</h1><h1 id=\"babylon\">Babylon</h1>");
 
-    check("a document with no request sees an empty one",
-          "= {{ Object.keys(req).length }}", "<h1 id=\"0\">0</h1>");
+    /*
+     * The ENTRY's `req` is not empty: the engine puts `today` on it, because a
+     * site compares a post's date against it to decide whether it is published
+     * yet. A build adds its own policy beside it (see
+     * mdy_engine_set_context_bool); this test renders through the engine
+     * directly, so `today` is all there is.
+     *
+     * This asserted an empty request until a real site disagreed — blog's tag
+     * pages dated an entry `undefined`.
+     */
+    check("the entry's request carries today",
+          "= {{ Object.keys(req).join(',') }}", "<h1 id=\"today\">today</h1>");
 
     refuses("a render that cycles", "{{ $.render(0) }}", "render depth exceeded");
 
@@ -958,7 +968,7 @@ int main(void) {
      *
      * An element written `href class rel title` comes back `href title class
      * rel` after passing through a transform — and mdy-docs does exactly the
-     * same, under node and under the QuickJS build alike. The expectation
+     * same under node. The expectation
      * below is what `node bin/mdy.js build` produces for this document, taken
      * from it rather than reasoned out.
      *

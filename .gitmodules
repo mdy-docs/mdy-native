@@ -1,6 +1,3 @@
-[submodule "third_party/quickjs"]
-	path = third_party/quickjs
-	url = https://github.com/bellard/quickjs.git
 [submodule "third_party/parse"]
 	path = third_party/parse
 	url = https://github.com/mdy-docs/parse.git

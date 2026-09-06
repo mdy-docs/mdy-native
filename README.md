@@ -1,38 +1,33 @@
 # mdy-native
 
-The backend as a binary: mdy-docs' own JavaScript in QuickJS, with the engines
-linked as C rather than loaded as WebAssembly. No renderer, no webview, no
-memory ceiling. See mdy-docs' `docs/desktop-plan.md` — "The backend is not a
-webview" — for the measurements that chose this.
-
-Beside it, and now the larger half, is a C ENGINE that runs a site with no
-QuickJS at all: the walk, the document store, the templates, composition and
-the output are C, and lamassu runs only the template code. `build/mdy-build`
-is that engine as a command.
+The mdy engine as a binary. The directory walk, the document store, the script
+layer, the parser, composition and the HTML are C; **lamassu runs only the code
+a document itself writes**, and no other JavaScript engine is linked.
 
 ```sh
-git clone --recurse-submodules https://github.com/mdy-docs/mdy-native
-cd mdy-native
-make -C third_party/parse           # the front end builds its own library
-make build/mdy-build                # the C engine
-./build/mdy-build <site-dir> --out <dir>
+make build/mdy-build             # the engine, as a command
+./build/mdy-build <dir> --out <dir>
+
+make check-engine                # its own checks, twice — see the target
+make check-sites                 # every site here, built BOTH ways and diffed
+make check-site SITE=<dir>       # one site, the same way
 ```
+
+Everything is built from source and nothing comes from a system package:
+lamassu, nisaba and the MDY front end are submodules, and stb is vendored.
+
+**It builds this repository's own 93-page site byte-for-byte identically to
+`node bin/mdy.js build`**, in about 6 seconds against node's 16.
 
 ## This repository is a package of mdy-docs
 
 It is `packages/mdy-native` of [mdy-docs](https://github.com/mdy-docs/mdy-docs),
-exported with its history, and the split is worth understanding before
-something fails to build:
-
-- **The C engine stands alone.** `make build/mdy-build`, `make check-engine`
-  and `make check-ingest` need only this checkout and its submodules — nisaba,
-  lamassu and the parse front end are all here.
-- **Everything involving mdy-docs' own JavaScript does not.** `make native`,
-  `make test`, `make site`, `make bench` and `make check-site` run mdy-docs'
-  code — its `index.js`, its `bin/mdy.js`, its `test/`. Those targets work
-  when this sits at `packages/mdy-native` inside an mdy-docs checkout, and
-  not otherwise. `make check-site` in particular builds a site BOTH ways and
-  diffs them, which is the whole point of it.
+exported with its history. The engine stands alone — `make build/mdy-build`,
+`make check-engine` and `make check-ingest` need only this checkout and its
+submodules. `make check-sites` and `make check-site` do NOT: they build a site
+with mdy-docs' own JavaScript to compare against, so they want this at
+`packages/mdy-native` inside an mdy-docs checkout. That comparison is the
+suite, so this is worth knowing before relying on the repository alone.
 
 Inside an mdy-docs checkout, point the two engine paths at the copies already
 there rather than checking out a second pair:
@@ -41,216 +36,54 @@ there rather than checking out a second pair:
 make NISABA=../../third_party/nisaba-db LAMASSU=../../third_party/lamassu-js …
 ```
 
-```sh
-make native            # build both halves, run the checks
-make test              # mdy-docs' OWN test suite, against this backend
-make site SITE=<dir>   # `mdy build`, natively
-make bench             # the same 200-document set, native and over WASM in node
-```
+## How it is tested
 
-Everything is built from source and nothing comes from a system package:
-QuickJS is a submodule, lamassu and nisaba are the parent's.
+By building real sites both ways and diffing every byte. `make check-sites`
+does that for the five in this repository, and it is the suite — not a
+supplement to one.
+
+That is a deliberate replacement. There used to be a second binary here that
+ran mdy-docs' own JavaScript in an embedded interpreter, and `make test` ran
+mdy-docs' 684 test files against it. It proved a claim about that binary —
+"mdy-docs runs unchanged on it" — and that binary is gone. What matters now is
+whether the C engine and mdy-docs agree on real input, which is a question only
+a differential test can answer. Pointing it at those five sites found eight
+bugs in an engine that already built a 93-page site identically, and **not one
+of them failed a unit test**: a `.yaml` file's own fields losing to derived
+identity, `mtime` as a number where mdy-docs has an ISO string, `.md` files not
+going through the markdown front end, no guest module loader, a cross-package
+`$.resize` reading from the wrong root, `.mdy` documents getting no `tags`,
+sidecars published out of `static/`, and every file but the last losing its
+trailing newline.
+
+`make check-engine` runs the unit checks twice, the second time collecting at
+every GC safe point. `make check-golden` and `make check-determinism` compare
+against committed output on a platform where node cannot run the build at all.
 
 **macOS, Linux and Windows all build and produce byte-identical output**, on
-every push, via [.github/workflows/native.yml](../../.github/workflows/native.yml):
+every push, via [.github/workflows/native.yml](../../.github/workflows/native.yml).
+Windows through MSYS2/mingw-w64: the build is a GNU makefile driving a Unix
+shell, so MSVC would want a real build file rather than a CI flag.
 
-```
-success  macOS      success  Linux      success  Windows
-  all 17 checks passed
-  fixture: identical to golden
-  fixture-pkg: identical to golden
-  messaging: identical to golden
-```
+## What is left
 
-Windows through MSYS2/mingw-w64 — a configuration QuickJS's own Makefile
-supports (it has an `MSYSTEM` branch), which is why this is mingw and not MSVC.
-Bellard's QuickJS does not build under MSVC at all; getting it would mean
-switching to the `quickjs-ng` fork, and that is a larger decision than a build
-system should make on its own.
+Two things differ from mdy-docs on purpose, and `make check-sites` pins each to
+an exact count so a change in either direction fails:
 
-## What is here right now
+- **A resized image's bytes.** mdy-docs resizes with Squoosh's codecs and this
+  uses stb — a different resampler and a different encoder. Same dimensions,
+  same paths, visually equivalent, different file.
+- **Raw HTML through the markdown front end.** md4c does not do rehype-raw's
+  HTML5 round trip, so a `.md` file that emits raw HTML for remark to stitch
+  back comes out with different blank lines around the block.
 
-**mdy-docs builds a site on this backend, and the output is byte-identical to
-the CLI's.** The reference corpus — 145 source files, an imported style
-package, a JS module graph — comes out as the same 93 pages `mdy build`
-produces, from a 2 MB binary that links no renderer and no node.
-
-```
-$ diff -r corpus-node corpus-native && echo IDENTICAL
-IDENTICAL
-```
-
-The same is true of `examples/docs-site` (11 pages, guest `import()` included),
-`examples/messaging`, and this package's own [fixture/](fixture/).
-
-`make native` is the test — exit status is the verdict, not a demo:
-
-```
---- mdy-native: mdy-docs on QuickJS, engines and filesystem in C ---
-  ok    the title, from the document's own front matter
-  ok    both cities, found by query
-  ok    …in the order they were written
-  ok    each one through a nested render
-  ok    the provider walks a directory recursively
-  …
-  ok    a guest `import` loaded a JS module
-  ok    …and that module imported its own dependency
-
-all 17 checks passed
-```
-
-Each one crosses a boundary the claim rests on rather than exercising mdy-docs,
-which has 776 tests of its own: a `$.find` goes guest → host → nisaba and back
-with a filter; a `$.render` recurses onto a second lamassu instance while the
-first is suspended mid-host-call; the strings carry an em dash and a cuneiform
-sign, so the UTF-8/UTF-16 round trip through both engines is checked rather
-than assumed; and `buildSite` renders, writes and copies `static/` through a
-filesystem that is five C functions.
-
-Nothing in mdy-docs knows any of this. [entry.mjs](entry.mjs) and
-[site-entry.mjs](site-entry.mjs) import `renderDocumentSet` and `buildSite`
-from the package the same way a node build does; the only substitution is two
-esbuild aliases in [scripts-build.mjs](scripts-build.mjs), and the three shims
-behind them are 260 lines together.
-
-### What it cost, measured
-
-Two workloads, because one number would be a lie in either direction. Both on
-the same machine, both against `mdy build` on node with the WASM engines.
-
-|                                   | node   | native | ratio  |
-| --------------------------------- | ------ | ------ | ------ |
-| **reference corpus**, 93 pages    | 10.6 s | 62.5 s | 5.9× slower |
-| peak RSS                          | 816 MB | 593 MB | 1.4× smaller |
-| **200 templates**, `make bench`   | 305 ms | 296 ms | a wash |
-| peak RSS                          | 148 MB | 19 MB  | 7.8× smaller |
-| runtime on disk                   | ~110 MB (node) | 2.0 MB | 55× smaller |
-
-The spread between those two rows is the whole story, and it is not noise.
-**QuickJS has no JIT**, and on mdy-docs' own JavaScript it runs several times
-slower than V8. **lamassu is now C rather than WebAssembly**, and there it is
-faster. Which effect wins depends entirely on what a site spends its time
-doing:
-
-- `make bench` is 200 documents of *templates* — one `$.find`, a nested render
-  each. That is lamassu's work, and native lamassu pays for QuickJS exactly.
-- The corpus is 145 files of long-form *prose*. That is micromark, remark,
-  hast and the MDY front end — JavaScript, all of it — and QuickJS's cost
-  shows through undiluted. A `sample` of the running build is unambiguous:
-  every frame is `JS_CallInternal`, `js_array_flatten`, `js_array_every`,
-  generators. No native call appears at all.
-
-So the honest summary is: **prose-heavy sites are slower here, template-heavy
-sites are not, and both use a fraction of the memory.** If the corpus number
-ever needs to come down, the profile names the target — the MDY front end,
-4,441 lines of our own producing hast directly, measured at 8.8× — and porting
-that one component to C would not cost rehype, since markdown still arrives
-through remark.
-
-Memory is what this was actually for, and it holds on both workloads. A webview
-build died at page 45 of this corpus against a 1146 MB ceiling. This finishes
-all 93, in less space than node, with no ceiling above it.
-
-### The bridge underneath
-
-```
---- mdy-native bridge ---
-  lamassu alone  : lamassu ran: 42
-  lamassu -> qjs : sandbox asked, host said: quickjs, from inside the sandbox
-```
-
-Three things established. The two engines link and run in one process; QuickJS
-can evaluate a lamassu program and read its value; and a lamassu program can
-call **out** to a function implemented in QuickJS. The third is the one that
-matters — every `$` a document uses is a call out of the sandbox into
-mdy-docs' JavaScript, so the whole design rests on that direction.
-
-Worth noting what this is not doing: the WASM build routes every host call
-through one `__hostcall(name, jsonArgs)` and pays JSON in both directions.
-That mechanism exists only in `src/wasm_api.c` — it is a workaround for the
-WASM boundary, not part of lamassu. Natively, functions are registered
-directly with `js_register_native` and values cross as values.
-
-## Two collisions, and why the files are split this way
-
-lamassu and QuickJS both use the `js_` namespace, and it bites twice.
-
-**Headers cannot meet.** lamassu's `JS_TAG_STRING` is a macro; QuickJS's is an
-enum member. Including both turns the enum into
-`UINT64_C(0xFFFA000000000000) = -7`. So `lam.c` includes lamassu and nothing
-else, `host.c` includes QuickJS and nothing else, and [src/lam.h](src/lam.h) is
-the only header both see — it names no type belonging to either. That is the
-right shape regardless; the collision only forced it sooner.
-
-**Symbols cannot meet either — and the first fix for that was wrong.** Both
-engines defined `js_dtoa`, and the original answer was to pre-link lamassu's
-two archives into one object with `ld -r -all_load -unexported_symbol
-_js_dtoa`, making the symbol local. That works, and it is ld64-only, so it
-quietly made macOS the one platform this could be built on.
-
-lamassu's `js_dtoa` is `static` now (52f0bfd), and the archives link directly.
-Comparing the two symbol tables afterwards said how small the real problem was:
-181 exports against 273, and `js_dtoa` was the only name in common.
-
-**But the pre-link was hiding something worse.** nisaba vendors
-`mdy-docs/regex-engine`; lamassu has moved to `mdy-docs/baru-re`, its successor
-— same ancestry, *different version*. Four internal names collide. Because
-`ld -r` loads every symbol unconditionally while an archive is pulled on
-demand, nisaba's `regexp.o` was never pulled at all, and any call it made to
-one of those four resolved to **lamassu's differently versioned
-implementation**. No error, no warning.
-
-They are renamed at compile time now (see `NIS_RENAME` in the Makefile), which
-keeps each engine's calls inside its own engine and turns any new overlap into
-a duplicate-symbol error rather than a new silent binding. The real fix is for
-nisaba to use baru-re as well, so the binary holds one regex engine instead of
-two.
-
-## Async host calls — the hard part, and it works
-
-A document calls `$.find(q)` synchronously; that is the language contract and
-every template depends on it. But mdy-docs implements those natives in
-JavaScript and several are async — a query awaits the database, a nested
-`$.render` awaits another render. The WASM build hides that with Asyncify.
-There is no Asyncify natively.
-
-Three ways out, and they are not equal. Rewriting the natives to be synchronous
-would diverge from the Node path forever. Making the guest `await` would break
-the contract that `$.find(q)` returns documents. So the native does neither: it
-calls into QuickJS and, if the answer is a promise, **pumps QuickJS's job queue
-until it settles**, then hands the value back synchronously. The guest never
-learns it waited, and mdy-docs' JavaScript is untouched.
-
-```
---- mdy-native: async host calls ---
-  sync native      : -> answered synchronously
-  async native     : -> answered after awaiting
-  re-entrant render: -> inner sandbox said: 42 * 2 = 84
-  never settles    : -> (promise never settled — nothing left to run)
-  unicode round trip: -> Ašared — Uruk’s scribes, ‰, 𒀭
-```
-
-Four of those matter.
-
-**Re-entrancy is fine, but it has to be stacked.** A nested `$.render` means
-sandbox → host → sandbox. The inner run gets its own `JsVm`, exactly as
-[../../src/vm.js](../../src/vm.js) gives each nesting level its own pooled
-instance, so nothing re-enters a suspended VM. What was NOT fine at first is
-subtler: lamassu passes a native no user pointer of its own, so "which VM is
-asking" lives in a global, and an inner `lam_eval` was overwriting the outer's.
-The symptom was a *second* nested render failing with `unknown native
-"render"` — the outer eval resumed holding the inner's identity, whose natives
-the VM pool had already torn down. `lam_eval` now saves and restores it.
-
-**A promise that cannot settle says so.** Pumping finds no job, and rather than
-hang, the deadlock is reported. In a native backend the filesystem is
-synchronous C so it should not arise — but a backend that hangs silently is the
-failure this whole exercise has been paying for.
-
-**Unicode survives, including astral.** That last line is not decoration: the
-first conversion truncated every byte to a code unit, and it was an em dash
-coming back as `???` that gave it away. The corpus is Akkadian transliteration
-and cuneiform, so this had to be right before anything real crossed.
+And one thing is simply not implemented: **mdy-docs memoises a render** on
+(document, request), and this does not. It is observable — a composition
+token's id depends on how many renders came before it, and a site that indexes
+its own `$.text` output indexes that number — and it is why `examples/blog`'s
+search index differs by one word. It is also the larger opportunity: the
+memoisation is what a site like this repository's own leans on, and the engine
+currently re-renders where mdy-docs would not.
 
 ## nisaba, natively
 
@@ -292,229 +125,6 @@ without one; the JS binding generates the ObjectId, so a native binding has to.
 That is the same rule met from the other side earlier: nisaba will not accept a
 scalar `_id`, and the primary tree's keys are fixed-width OID bytes.
 
-## mdy-docs' own tests, on this backend
-
-```
-macOS    # native: 684 passed, 0 failed, 1 skipped in 807ms
-Linux    # native: 684 passed, 0 failed, 1 skipped in 676ms
-Windows  # native: 684 passed, 0 failed, 1 skipped in 907ms
-```
-
-Not a copy and not a rewrite: [tests-entry.mjs](tests-entry.mjs) imports the
-same files `npm test` runs, in place. A copy would drift, and a suite that has
-drifted proves nothing about the thing it is meant to be checking. What changes
-is only what `node:test`, `node:assert`, `node:fs`, `node:path`, `node:os`,
-`node:url`, `node:zlib` and `node:vm` resolve to — [shims/node/](shims/node/),
-about 700 lines over the C in [src/fsx.c](src/fsx.c).
-
-This is the strongest evidence for what this package actually claims. The
-backend's premise is that it runs mdy-docs *unchanged*; mdy-docs' own tests
-passing on it says that, where a separate native suite would only ever check
-what someone thought to re-check.
-
-Aliasing `node:fs/promises` has a second effect worth knowing: `nodeFsProvider`
-reaches for it through a lazy dynamic import, so the DEFAULT provider works
-natively too. A test that calls `renderScriptSite(dir)` with no provider runs
-here with nothing changed.
-
-**What does not run, and why each is the runtime rather than the port.** 91 of
-776 tests, in five files plus one:
-
-| | |
-| --- | --- |
-| `cli.test.js` (34) | spawns `bin/mdy.js` as a subprocess. There is no `child_process` here and there should not be — this backend *is* the thing a CLI would spawn. |
-| `build.test.js` (28) | builds `examples/blog` at module top level, and that example calls `$.resize`. The file cannot be imported. `site-memory-build.test.js` covers `buildSite` through a provider, which is the path this backend takes. |
-| `serve.test.js` (11) | stands up a `node:http` server. Serving is the plan's Phase 1c. |
-| `images.test.js` (10) | the @jsquash codecs are WebAssembly. |
-| `search-widget.test.js` (5) | runs the shipped widget against a fake DOM; it is testing browser JavaScript. |
-| `opfs-provider.test.js` (3) | OPFS is a browser API. |
-
-One further test is skipped **by name**, with its reason printed — `$.resize`
-producing a real thumbnail, for the same WebAssembly reason. The runner fails
-if a name on that list matches nothing, so a stale entry cannot quietly hide a
-real result.
-
-### Six things the port found
-
-Porting a suite is worth it for what it turns up, and this turned up four.
-
-- **A collection had no lifetime.** `nis_open` handed back an integer from a
-  fixed table of eight, and nothing ever closed one — fine for a build, which
-  opens one set per package, and wrong the moment a suite opened one per test.
-  The table grows now, and more importantly the handle rides inside a JS object
-  whose **finalizer** closes it, so a collection is reclaimed when the
-  JavaScript that owned it becomes unreachable. That is the lifetime nisaba's
-  WASM binding gets from its own GC; this is a native host earning the same.
-- **A rejected host call was wrapped, not propagated.** Prefixing the reason
-  with "the host rejected: " looked harmless until a cyclic `$.render` — every
-  level of the recursion added another copy and the depth guard's message
-  arrived buried under a dozen of them. The WASM binding rethrows verbatim, and
-  now so does this.
-- **There was no `setTimeout`.** QuickJS's timers live in quickjs-libc, which
-  this host deliberately does not link. The job pump is now a small event loop:
-  when no job is ready and a timer is pending, it waits for the earliest and
-  fires it. Enough, because nothing here has I/O to wait on — the filesystem is
-  synchronous C.
-- **A test was coupled to V8's wording.** `missing is not defined` in V8,
-  `'missing' is not defined` in QuickJS, for the same `ReferenceError` — and
-  script blocks run in the *host* runtime (`new Function`), so which one that
-  is depends on where mdy-docs is running. The test now matches either; its
-  intent was that the failure names the missing identifier.
-
-Two more came from running it on Windows, and only Windows could have found
-them:
-
-- **A timer that is not due yet is not "nothing left to run".** Its clock has
-  ~15.6 ms granularity and `Sleep` can return early, so the event loop would
-  wake from a 10 ms timer with the clock reading the same tick, fire nothing,
-  and report the promise as unsettleable. A timer existing means progress is
-  guaranteed, so waiting *is* progress.
-- **`/C:/…` is a drive path with a spurious leading slash.** mdy-docs says
-  "this path is absolute" by passing it as `fs.read('/', absolutePath)`, and
-  `nodeFsProvider` joins the two before the filesystem sees them — producing
-  `/D:/…` on Windows, which names nothing, so every guest `import` failed.
-  Node's own win32 `join` does the same; it is not a case it was built for.
-
-`fs.watch` is polled rather than native, and that is said plainly in the shim.
-A real recursive watcher is kqueue, inotify and `ReadDirectoryChangesW` — the
-plan's Phase 3 — and mdy-docs already ships `watchByPolling` as its own
-fallback where a native watcher is unavailable, so this is the codebase's
-existing position rather than a new one.
-
-## Three platforms
-
-The only files that know which operating system this is are
-[fsx.c](src/fsx.c), [nis.c](src/nis.c) and [oswin.c](src/oswin.c). Both engines
-are platform-clean — lamassu has no `#ifdef`s at all, and nisaba's I/O sits
-behind its four `bj_io` callbacks — so Windows was a second version of those
-and nothing else: `FindFirstFileW` for the walk, `OVERLAPPED` for
-`pread`/`pwrite` (Windows has no positioned read; the offset rides in the
-OVERLAPPED, which is how the "does not disturb the file pointer" guarantee
-survives), `SetEndOfFile`, and `FILE_FLAG_DELETE_ON_CLOSE` for the collection's
-backing file — the same self-deleting lifetime `mkstemp` + `unlink` gives.
-
-Two rules hold it together and both are load-bearing:
-
-- **Paths cross this boundary as UTF-8, and every Win32 call is the wide
-  variant.** The narrow entry points go through the process code page, which
-  cannot spell most of what the reference corpus is named.
-- **`/` is the separator everywhere.** Win32 accepts it in every path it is
-  given, so the only place a backslash can enter is `fsx_cwd`, where the OS
-  hands one back — and it is translated there rather than in every place it
-  would otherwise surface. This matters more than it looks: `src/imports.js`
-  decides a module is inside its package by string prefix, so two spellings of
-  one path are two packages. `golden/fixture-pkg` is the test for it.
-
-The drive letter needs handling in exactly two places, both found by reasoning
-rather than by a red build: `at()` in fsx.c, where an absolute `rel` under a
-root of `/` would otherwise produce `/C:/Users/…`, and `site-entry.mjs`, where
-`C:/work` would otherwise be treated as relative and have the cwd prepended.
-
-Three things CI found that reasoning had not:
-
-- **glibc hides POSIX declarations under `-std=c11`.** `strdup` came back as an
-  implicit declaration and `st_mtim` as an unknown field — both fine on macOS,
-  which exposes them regardless. `gnu11` now.
-- **`npm install` runs node-gyp on Windows and fails** for want of Visual
-  Studio: `@mdy-docs/nisaba-db` → `node-opfs` → `fs-ext` carries a
-  `binding.gyp`. Nothing on the native path uses it, so CI installs with
-  `--ignore-scripts`; node is here only to run esbuild, which resolves its
-  platform binary from optionalDependencies and needs no install script.
-- **Line endings are build output.** `static/` is a verbatim passthrough, so a
-  stylesheet checked out with CRLF is emitted with CRLF, and Windows runners
-  default to `core.autocrlf=true`. `.gitattributes` marks everything whose
-  bytes reach the output, and the output itself, as `-text`.
-
-## The filesystem, and guest `import`
-
-Both were the last structural gaps, and both are now shipped.
-
-**The filesystem** is [src/fsx.c](src/fsx.c) — five POSIX calls, held behind
-[src/fsx.h](src/fsx.h) so nothing from any engine crosses — and
-[shims/fs.js](shims/fs.js), which builds the nine-method contract in
-[../../src/fs-provider.js](../../src/fs-provider.js) on them. The methods are
-`async` because the contract is, not because anything waits.
-
-A listing crosses as ONE newline-separated string, not an array: the corpus is
-thousands of paths, and building that many JSValues to immediately join them is
-work neither side needs. `d_type` is not trusted — several filesystems answer
-`DT_UNKNOWN` from a directory entry, and a walk that believes it silently loses
-whole subtrees, so an unknown falls back to `stat`.
-
-`watch` is absent, deliberately. It is optional at every call site
-(`fs.watch?.(…)`), and a native recursive watcher is kqueue, inotify and
-`ReadDirectoryChangesW` — three implementations, which is the plan's Phase 3
-and not a line to sneak in here. A build does not watch; `mdy dev` does.
-
-See "Three platforms" above for how the rest of it reaches Windows.
-
-**Guest `import`** is `js_set_module_loader` in [src/lam.c](src/lam.c), routed
-out to mdy-docs' own loader (which reads through the provider and enforces the
-package boundary — see `canonicalizeModule` in ../../src/imports.js). Two
-things about it cost a cycle each:
-
-- **Source modules are off by default.** `js_enable_source_modules` is a
-  frontend call, and without it a loader that resolves with source fails at the
-  fetch with "source modules unavailable in this build (precompile to
-  bytecode)". That reads like a missing library and is really a missing line —
-  the split exists so a runtime-only build cannot compile source it is handed,
-  which is a link-time guarantee rather than a policy.
-- **A root spelled with `..` breaks the package boundary check.** imports.js
-  decides a module is inside its package by string prefix, which is the right
-  check; a root of `../../examples/docs-site` then makes every one of that
-  site's own modules look like an escape attempt. The normalisation belongs in
-  the host, where the spelling comes from.
-
-`buildSite` itself now writes through the provider rather than node:fs, so this
-backend runs the CLI's own build function instead of reimplementing it beside
-it. That was a change to mdy-docs, and the 776 tests cover it.
-
-**`$.resize` does not work here, and cannot.** Its image codecs are
-WebAssembly, and QuickJS has none. mdy-docs now says exactly that at the point
-it is true, because the failure otherwise arrived as a missing `node:fs` and
-then again, unrecognisably, as a null tree in whatever page used it.
-
-## The shims
-
-Three files, and all short because mdy-docs asks for very little.
-[shims/lamassu.js](shims/lamassu.js) is `createLamassu()` with
-`eval` / `setNatives` / `setModuleLoader` / `reset`, and it keeps the
-`__hostcall(name, argsJson)` contract exactly as `buildProgram` generates it —
-values could have crossed as values natively, but keeping the JSON means the
-generated program is byte-identical on both backends, and one fewer thing
-differs while both exist. [shims/nisaba.js](shims/nisaba.js) is `connect`, a
-collection, `insertOne`, `find().toArray()` and `createIndex`, with documents
-crossing as binjson encoded by the reference JS codec from nisaba's own
-submodule. [shims/fs.js](shims/fs.js) is the provider above.
-
-Instances are pooled, not made per eval — `createLamassu()` allocates a real
-`JsVm`, as it does over WASM, and `../../src/vm.js`'s pool is what reuses them.
-(Worth recording that this did NOT move the corpus number: creating a VM per
-eval cost about 1% of the build, not the 60 s the profile was hiding. It is
-still the right shape, and it is what `reset()` needs to be honest.)
-
-Adaptations worth knowing about, because each was a silent failure first:
-
-- **`lam_eval` answers with the completion value; `lamassu_eval` answers with a
-  transcript** whose completion value is the line after `⇒ `. The latter is the
-  WASM export layer, which a native host does not have, and it is the shape
-  `src/vm.js` reads. The shim puts the marker back rather than teaching vm.js
-  which backend it is talking to.
-- **The `_id` has to be the codec's own `ObjectId`.** A hand-rolled
-  `{ $oid: bytes }` encodes to something `dc_insert_one` rejects — and it
-  rejects it by returning `-1`, which the shim was ignoring, so inserts
-  "succeeded" and every query came back empty. The class also gives the 24-hex
-  `toString` that `src/mdy.js` keys its index map by, so an inserted document
-  and a found one agree without either side knowing about the other.
-- **A native that fails must throw INSIDE the sandbox**, which is what the WASM
-  binding does and what mdy-docs' generated program is written for — its
-  try/catch turns it into "document N failed: …". Answering `null` instead
-  turned one legible error into a cascade of unrelated ones about null trees.
-- **`push(...array)` is an argument list**, and every engine caps those. V8
-  allows enough that binjson's encoder looked correct for years; QuickJS stops
-  at 65534, and the corpus has documents with more encoded pieces than that.
-  Fixed in binjson itself — the count is a property of the data, so the only
-  safe number of arguments is one.
 
 ## The MDY front end, in C
 
@@ -624,7 +234,7 @@ fixed-width OID bytes and refuses anything else.
 ## The C engine: one document, end to end
 
 `make check-engine` renders a document with **no JavaScript engine but
-lamassu**. QuickJS is not linked into that binary at all — `nm` finds zero of
+lamassu**. No other JavaScript engine is linked into that binary — `nm` finds zero of
 its symbols in it.
 
 It is mdy-docs' own three passes (src/mdy.js's file comment), done in C:
@@ -758,9 +368,8 @@ kept as a copy that can drift.
 
 One result is worth recording because it looks like a bug and is not. An
 element written `href class rel title` comes back `href title class rel` after
-a transform — and mdy-docs does the same, under node and under the QuickJS
-build alike. `check-engine` pins the order against what `node bin/mdy.js build`
-produces.
+a transform — and mdy-docs does the same under node. `check-engine` pins the
+order against what `node bin/mdy.js build` produces.
 
 Two gaps remain. There is no `js_function_new`, only `js_register_native` for
 globals — so `$` is built in the wrapper source over one global native rather

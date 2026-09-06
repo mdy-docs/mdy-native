@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 #include <string.h>
 
 #include "lamassu.h"
@@ -42,6 +43,13 @@ typedef struct {
     mdy_chunk matter;     /* its front matter, unparsed */
     mdy_data *fences;     /* its ```data fences, and the body without them */
     uint8_t oid[12];
+    /*
+     * A `.md` document is the OTHER front end: markup with no code in it, so
+     * there is nothing to run. It goes straight to hast at its own boundary
+     * and joins everything else as a tree, and `$.text` on it gives back the
+     * file — there was no code to write anything else.
+     */
+    int is_markdown;
 } Document;
 
 /* A resolved `% import name from "spec"`. `set` is owned by the cache, not
@@ -95,6 +103,9 @@ struct mdy_engine {
     struct mdy_engine *tokens;
     Held *held;
     size_t held_count, held_cap;
+    /* Trees kept alive but never named — see keep_alive. */
+    mdy_doc **kept;
+    size_t kept_count, kept_cap;
     size_t next_token;
     int depth;                  /* renders inside renders */
     void (*on_emit)(void *ud, const char *path, const char *content);
@@ -107,6 +118,10 @@ struct mdy_engine {
      * that imported it do not each make their own copy. */
     Resized *resized;
     size_t resized_count;
+    /* Extra fields for the entry's `req`, set by the embedder. */
+    char **ctx_names;
+    char *ctx_bools;
+    size_t ctx_count;
     /* `_id` to index, in insertion order, so a hit maps back to its document. */
     uint8_t (*ids)[12];
 
@@ -150,9 +165,13 @@ struct mdy_engine {
      */
     char **ident_pre;
     char **ident_post;
+    char *ident_is_md;
     size_t identity_count;
 
     char *root;
+    /* Scratch for the module canonicalizer: the engine copies the result
+     * before the call returns, so it need only outlive the call. */
+    uint16_t *module_spec;
     Import *imports;
     size_t import_count, import_cap;
     ImportCache *cache;
@@ -689,12 +708,39 @@ static char *hold_tree(mdy_engine *e, mdy_doc *doc, mdy_node *tree) {
     return token;
 }
 
+/*
+ * Keep a document alive for the rest of the render WITHOUT naming it.
+ *
+ * `$.text` and `$.parse` both produce a tree that has to outlive the call —
+ * `$.text` because a token spliced into it points at held nodes, `$.parse`
+ * because the value handed back does — but neither hands out a token for it.
+ * Minting one anyway advances the token counter, and that counter is
+ * OBSERVABLE: a token's id is in the text `$.text` returns, so a site that
+ * indexes its own output indexes the number. Two extra holds moved every id
+ * after them and a search index disagreed with mdy-docs' by one word.
+ */
+static void keep_alive(mdy_engine *e, mdy_doc *doc) {
+    mdy_engine *t = token_table(e);
+    if (t->kept_count == t->kept_cap) {
+        size_t want = t->kept_cap ? t->kept_cap * 2 : 8;
+        mdy_doc **grown = realloc(t->kept, want * sizeof *grown);
+        if (!grown) return;
+        t->kept = grown;
+        t->kept_cap = want;
+    }
+    t->kept[t->kept_count++] = doc;
+}
+
 static void release_held(mdy_engine *e) {
     mdy_engine *t = token_table(e);
     for (size_t i = 0; i < t->held_count; i++) mdy_free(t->held[i].doc);
     free(t->held);
     t->held = NULL;
     t->held_count = t->held_cap = 0;
+    for (size_t i = 0; i < t->kept_count; i++) mdy_free(t->kept[i]);
+    free(t->kept);
+    t->kept = NULL;
+    t->kept_count = t->kept_cap = 0;
 }
 
 /* Whitespace, and nothing else. */
@@ -946,6 +992,41 @@ static const char *extension_of(const char *name) {
 /* The extensions mdy-docs reads dimensions for. A record carrying width and
  * height is what lets a template lay a page out without opening the file, and
  * `$.resize` refuses without them. */
+/*
+ * Epoch milliseconds as ISO 8601 UTC — `2026-09-05T23:34:15.172Z`, which is
+ * what a raw record's `mtime` IS. It is not a number: a site formats it by
+ * matching `/^(\d{4})-(\d{2})-(\d{2})/` against it, and a number matches
+ * nothing, so a "last updated" line silently disappears rather than failing.
+ *
+ * The civil date comes from Howard Hinnant's civil_from_days, the inverse of
+ * the one $.rfc822 uses, rather than from gmtime — no locale, no time zone,
+ * no platform in it at all.
+ */
+static void iso8601_utc(double epoch_ms, char *out, size_t out_len) {
+    long long ms = (long long)epoch_ms;
+    long long days = ms / 86400000;
+    long long rem = ms % 86400000;
+    if (rem < 0) { rem += 86400000; days -= 1; }     /* floor, not truncate */
+
+    long long z = days + 719468;
+    long long era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned long long doe = (unsigned long long)(z - era * 146097);
+    unsigned long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long long y = (long long)yoe + era * 400;
+    unsigned long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned long long mp = (5 * doy + 2) / 153;
+    unsigned long long d = doy - (153 * mp + 2) / 5 + 1;
+    unsigned long long m = mp + (mp < 10 ? 3 : -9);
+    y += (m <= 2);
+
+    int hour = (int)(rem / 3600000);
+    int minute = (int)((rem / 60000) % 60);
+    int second = (int)((rem / 1000) % 60);
+    int milli = (int)(rem % 1000);
+    snprintf(out, out_len, "%04lld-%02llu-%02lluT%02d:%02d:%02d.%03dZ",
+             y, m, d, hour, minute, second, milli);
+}
+
 static int is_image_ext(const char *ext) {
     static const char *const EXTS[] = {
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
@@ -1039,7 +1120,31 @@ static int tag_char(unsigned char c) {
            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '/' || c >= 0x80;
 }
 
-static void put_tags(char **buf, size_t *len, size_t *cap, const char *text, size_t tlen) {
+/* Lowercased, deduped, in order of first appearance. Returns how many. */
+static size_t add_tag(char (**tags)[128], size_t *count, size_t *cap,
+                      const char *name, size_t name_len) {
+    if (name_len == 0 || name_len >= 128) return *count;
+    char lowered[128];
+    for (size_t i = 0; i < name_len; i++) {
+        char c = name[i];
+        lowered[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    lowered[name_len] = '\0';
+    for (size_t i = 0; i < *count; i++)
+        if (strcmp((*tags)[i], lowered) == 0) return *count;
+    if (*count == *cap) {
+        size_t want = *cap ? *cap * 2 : 8;
+        void *grown = realloc(*tags, want * sizeof **tags);
+        if (!grown) return *count;
+        *tags = grown;
+        *cap = want;
+    }
+    memcpy((*tags)[(*count)++], lowered, name_len + 1);
+    return *count;
+}
+
+static void scan_hashtags(const char *text, size_t tlen,
+                          char (**out)[128], size_t *count, size_t *cap) {
     mdy_script *script = mdy_script_compile(text, tlen);
 
     char *prose = malloc(tlen + 1);
@@ -1088,8 +1193,6 @@ static void put_tags(char **buf, size_t *len, size_t *cap, const char *text, siz
         } else i++;
     }
 
-    char (*tags)[128] = NULL;
-    size_t tag_count = 0, tag_cap = 0;
     for (size_t i = 0; i < plen; i++) {
         if (prose[i] != '#') continue;
         /* A tag starts at a boundary and its first character is a letter. */
@@ -1106,30 +1209,27 @@ static void put_tags(char **buf, size_t *len, size_t *cap, const char *text, siz
         size_t name_len = j - i - 1;
         if (name_len == 0 || name_len >= 128) { i = j; continue; }
 
-        char name[128];
-        for (size_t k = 0; k < name_len; k++) {
-            char c = prose[i + 1 + k];
-            name[k] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-        }
-        name[name_len] = '\0';
+        const char *name = prose + i + 1;
 
-        int seen = 0;
-        for (size_t k = 0; k < tag_count && !seen; k++) seen = strcmp(tags[k], name) == 0;
-        if (!seen) {
-            if (tag_count == tag_cap) {
-                tag_cap = tag_cap ? tag_cap * 2 : 8;
-                void *grown = realloc(tags, tag_cap * sizeof *tags);
-                if (!grown) break;
-                tags = grown;
-            }
-            memcpy(tags[tag_count++], name, name_len + 1);
-        }
+        add_tag(out, count, cap, name, name_len);
         i = j - 1;
     }
     free(prose);
+}
 
-    if (tag_count > 0) {
-        size_t need = *len + tag_count * 132 + 32;
+/*
+ * A `.md` file's tags come from the WALK, not from the ingest: its document
+ * body is a placeholder, and the markdown is on its data. So the hashtags are
+ * scanned here, from the file, and land in the record as declared tags —
+ * which the ingest then carries through unchanged.
+ */
+static void put_tags_from_text(char **buf, size_t *len, size_t *cap,
+                               const char *text, size_t tlen) {
+    char (*tags)[128] = NULL;
+    size_t count = 0, cap_t = 0;
+    scan_hashtags(text, tlen, &tags, &count, &cap_t);
+    if (count > 0) {
+        size_t need = *len + count * 132 + 32;
         if (need > *cap) {
             while (need > *cap) *cap *= 2;
             char *grown = realloc(*buf, *cap);
@@ -1137,11 +1237,12 @@ static void put_tags(char **buf, size_t *len, size_t *cap, const char *text, siz
             *buf = grown;
         }
         *len += (size_t)snprintf(*buf + *len, *cap - *len, "tags:\n");
-        for (size_t k = 0; k < tag_count; k++)
+        for (size_t k = 0; k < count; k++)
             *len += (size_t)snprintf(*buf + *len, *cap - *len, "  - \"%s\"\n", tags[k]);
     }
     free(tags);
 }
+
 
 
 /* ---- the import graph --------------------------------------------------------
@@ -1433,13 +1534,22 @@ static int open_dir_inner(mdy_engine *e, const char *root, ImportCache *cache,
          * own data unreachable — but `path` is structurally required to be
          * real, because everything resolves documents by it.
          */
+        /*
+         * The separator carries its OWN line break, and the first file gets
+         * none: the splitter joins LINES, so a file's trailing newline
+         * survives only as an empty final line before the `---`. Fold that
+         * newline into the file's text instead and a file with none gains
+         * one; leave it out and every file but the last loses one.
+         */
         char head[2048];
-        int head_len = snprintf(head, sizeof head, "---\n");
+        int head_len = snprintf(head, sizeof head, "%s---\n", len ? "\n" : "");
         /* Identity, kept OUT of the text — see `identity` on the engine. */
+        char when[40];
+        iso8601_utc(mtime, when, sizeof when);
         char ident[4096];
         int ident_len = snprintf(ident, sizeof ident,
-            "name: \"%s\"\next: \"%s\"\nsize: %.0f\nmtime: %.0f\npath: \"%s\"\n",
-            name, ext, size, mtime, rel);
+            "name: \"%s\"\next: \"%s\"\nsize: %.0f\nmtime: \"%s\"\npath: \"%s\"\n",
+            name, ext, size, when, rel);
         /*
          * A picture's dimensions, read from its header. Not decodable —
          * corrupt, truncated, a variant this does not know — is not an error:
@@ -1477,7 +1587,7 @@ static int open_dir_inner(mdy_engine *e, const char *root, ImportCache *cache,
                  * must not be misread — so the text is DATA: findable in
                  * `body`, with the document itself a placeholder. */
                 put_block_scalar(&source, &len, &cap, "body", (const char *)bytes, body_len);
-                put_tags(&source, &len, &cap, (const char *)bytes, body_len);
+                put_tags_from_text(&source, &len, &cap, (const char *)bytes, body_len);
             }
             if (is_yaml && bytes) {
                 /* A data file's own fields — it IS the front matter. */
@@ -1528,16 +1638,29 @@ static int open_dir_inner(mdy_engine *e, const char *root, ImportCache *cache,
             memcpy(source + len, PLACEHOLDER_BODY, strlen(PLACEHOLDER_BODY));
             len += strlen(PLACEHOLDER_BODY);
         }
-        if (len && source[len - 1] != '\n') source[len++] = '\n';
+        /*
+         * A newline of its OWN before the next `---`.
+         *
+         * Every file becomes a document in one source, separated by `---`, and
+         * the splitter takes the newline immediately before a separator as
+         * part of it. Without a spare one here, every file but the last loses
+         * its final newline — so `$.text` on it came back a byte short, and a
+         * robots.txt or a sitemap ended without the newline it was written
+         * with. mdy-docs does not hit this because it opens an ARRAY of
+         * sources, one per file, and never concatenates them.
+         */
         source[len] = '\0';
 
         /* One identity per document this file became. */
         for (size_t k = 0; k < doc_count; k++) {
             char **pre = realloc(e->ident_pre, (e->identity_count + 1) * sizeof *pre);
             char **post = realloc(e->ident_post, (e->identity_count + 1) * sizeof *post);
+            char *md = realloc(e->ident_is_md, e->identity_count + 1);
             if (pre) e->ident_pre = pre;
             if (post) e->ident_post = post;
-            if (!pre || !post) break;
+            if (md) e->ident_is_md = md;
+            if (!pre || !post || !md) break;
+            e->ident_is_md[e->identity_count] = (char)(is_md ? 1 : 0);
             if (is_yaml) {
                 /* A default: the file's own fields win, except `path`. */
                 char only_path[2048];
@@ -1622,6 +1745,68 @@ const char *mdy_engine_root_at(mdy_engine *e, size_t i) {
     if (e->cache && e->owns_cache)
         return i < e->cache->root_count ? e->cache->roots[i] : NULL;
     return i == 0 ? e->root : NULL;
+}
+
+
+/*
+ * A document's `tags`: what its front matter and data fences DECLARE, plus the
+ * `#hashtags` its prose mentions, lowercased and deduped in order of first
+ * appearance.
+ *
+ * Both halves matter and they are not the same thing. The scan runs over the
+ * RAW body, before any code has run, because a tag is static metadata about
+ * the authored document — that is what lets `$.withTag` answer without
+ * rendering every document in the set to find out. A `#{{ topic }}` generated
+ * at render time is not a tag.
+ *
+ * `tags` is set when there are any OR when a part declared the key at all, so
+ * a document that says `tags: []` keeps its empty list rather than losing it.
+ */
+static void put_document_tags(char **buf, size_t *len, size_t *cap,
+                              const mdy_yaml_node *const *parts, size_t part_count,
+                              const char *body, size_t body_len) {
+    char (*tags)[128] = NULL;
+    size_t count = 0, cap_t = 0;
+    int declared_key = 0;
+
+    for (size_t i = 0; i < part_count; i++) {
+        if (!parts[i] || mdy_yaml_type_of(parts[i]) != MDY_YAML_MAPPING) continue;
+        const mdy_yaml_node *v = mdy_yaml_get(parts[i], "tags");
+        if (!v) continue;
+        declared_key = 1;
+        if (mdy_yaml_type_of(v) == MDY_YAML_STRING) {
+            size_t n = 0;
+            const char *t = mdy_yaml_string(v, &n);
+            if (t) add_tag(&tags, &count, &cap_t, t, n);
+        } else if (mdy_yaml_type_of(v) == MDY_YAML_SEQUENCE) {
+            for (size_t k = 0; k < mdy_yaml_count(v); k++) {
+                const mdy_yaml_node *item = mdy_yaml_at(v, k);
+                size_t n = 0;
+                const char *t = item ? mdy_yaml_string(item, &n) : NULL;
+                if (t) add_tag(&tags, &count, &cap_t, t, n);
+            }
+        }
+    }
+
+    scan_hashtags(body, body_len, &tags, &count, &cap_t);
+
+    if (count > 0 || declared_key) {
+        size_t need = *len + count * 132 + 32;
+        if (need > *cap) {
+            while (need > *cap) *cap *= 2;
+            char *grown = realloc(*buf, *cap);
+            if (!grown) { free(tags); return; }
+            *buf = grown;
+        }
+        if (count == 0) {
+            *len += (size_t)snprintf(*buf + *len, *cap - *len, "tags: []\n");
+        } else {
+            *len += (size_t)snprintf(*buf + *len, *cap - *len, "tags:\n");
+            for (size_t k = 0; k < count; k++)
+                *len += (size_t)snprintf(*buf + *len, *cap - *len, "  - \"%s\"\n", tags[k]);
+        }
+    }
+    free(tags);
 }
 
 int mdy_engine_open_dir(mdy_engine *e, const char *root, char *error, size_t error_len) {
@@ -1984,9 +2169,9 @@ static bool text_native(JsContext *ctx, JsValue this_val, const JsValue *args,
     size_t len = text ? strlen(text) : 0;
     *result = str(e->vm, text ? text : "", len);
     free(text);
-    /* The tree is held so it outlives this call, like any other render's. */
-    char *token = hold_tree(e, doc, mdy_root(doc));
-    free(token);
+    /* The tree outlives this call — a token spliced into it points at held
+     * nodes — but nothing will ask for it by name. */
+    keep_alive(e, doc);
     return true;
 }
 
@@ -2112,6 +2297,7 @@ int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
         mdy_chunk body;
         mdy_split_frontmatter(d->chunk.text, d->chunk.len, &d->matter, &body);
         d->fences = mdy_data_extract(body.text, body.len);
+        d->is_markdown = e->ident_is_md && i < e->identity_count && e->ident_is_md[i];
 
         /*
          * The document's DATA: its front matter, with each ```data fence
@@ -2124,8 +2310,8 @@ int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
         if (d->matter.len) matter = mdy_yaml_parse(d->matter.text, d->matter.len, err, sizeof err);
 
         size_t fence_count = d->fences ? mdy_data_count(d->fences) : 0;
-        /* identity-as-default + front matter + every data fence + identity */
-        const mdy_yaml_node **maps = calloc(fence_count + 3, sizeof *maps);
+        /* identity-as-default + front matter + fences + tags + identity */
+        const mdy_yaml_node **maps = calloc(fence_count + 4, sizeof *maps);
         mdy_yaml **parsed = calloc(fence_count + 1, sizeof *parsed);
         if (!maps || !parsed) { free(maps); free(parsed); mdy_yaml_free(matter); close_set(e); return -1; }
 
@@ -2145,6 +2331,30 @@ int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
             maps[used++] = mdy_yaml_root(y);
         }
 
+
+        /*
+         * `tags`, from the parts that declare them plus the hashtags in the
+         * body. A mapping of its own, merged after the parts it was computed
+         * from, because it REPLACES whatever `tags` they held with the merged
+         * list — which is what Object.assign then a single `data.tags = tags`
+         * does on the JavaScript side.
+         */
+        mdy_yaml *tag_map = NULL;
+        {
+            size_t body_len = 0;
+            const char *body = mdy_data_body(d->fences, &body_len);
+            char *text = malloc(256);
+            size_t tlen = 0, tcap = 256;
+            if (text) {
+                text[0] = '\0';
+                put_document_tags(&text, &tlen, &tcap, maps, used, body ? body : "", body_len);
+                if (tlen > 0) {
+                    tag_map = mdy_yaml_parse(text, tlen, err, sizeof err);
+                    if (tag_map) maps[used++] = mdy_yaml_root(tag_map);
+                }
+                free(text);
+            }
+        }
 
         /* After them, where identity WINS — and, for a data file, the one
          * field that must be real whatever it declared. */
@@ -2168,6 +2378,7 @@ int mdy_engine_open(mdy_engine *e, const char *source, size_t len,
         mdy_yaml_free(matter);
         mdy_yaml_free(pre);
         mdy_yaml_free(post);
+        mdy_yaml_free(tag_map);
         for (size_t f = 0; f < fence_count; f++) mdy_yaml_free(parsed[f]);
         free(maps);
         free(parsed);
@@ -2207,6 +2418,17 @@ void mdy_engine_on_binary(mdy_engine *e,
                           void *ud) {
     e->on_binary = fn;
     e->on_binary_ud = ud;
+}
+
+void mdy_engine_set_context_bool(mdy_engine *e, const char *name, int value) {
+    char **names = realloc(e->ctx_names, (e->ctx_count + 1) * sizeof *names);
+    char *bools = realloc(e->ctx_bools, e->ctx_count + 1);
+    if (names) e->ctx_names = names;
+    if (bools) e->ctx_bools = bools;
+    if (!names || !bools) return;
+    e->ctx_names[e->ctx_count] = strdup(name);
+    e->ctx_bools[e->ctx_count] = (char)(value ? 1 : 0);
+    e->ctx_count++;
 }
 
 /* ---- querying ---------------------------------------------------------------
@@ -2600,7 +2822,7 @@ static bool parse_native(JsContext *ctx, JsValue this_val, const JsValue *args,
     *result = tree_to_js(e, mdy_root(doc));
     /* The document owns it until the render finishes: the value handed back is
      * a copy in the VM, but a token spliced into it points at held nodes. */
-    hold_tree(e, doc, (mdy_node *)mdy_root(doc));
+    keep_alive(e, doc);
     return true;
 }
 
@@ -3225,10 +3447,44 @@ struct Resized {
     int width, height;
 };
 
+/*
+ * `from` is the package whose FILE is being read, which is not always the one
+ * whose code asked. `style.resize(logo, …)` names a record belonging to the
+ * imported package, and its bytes are under that package's root — reading
+ * them relative to the importer's finds nothing.
+ */
+static bool resize_in(mdy_engine *e, mdy_engine *from, const JsValue *args,
+                      int argc, JsValue *result);
+
 static bool resize_native(JsContext *ctx, JsValue this_val, const JsValue *args,
                           int argc, JsValue *result) {
     (void)this_val;
     mdy_engine *e = js_context_userdata(ctx);
+    return resize_in(e, e, args, argc, result);
+}
+
+/* `$.__importResize(spec, record, options)` — the same work, reading from the
+ * imported package. */
+static bool import_resize_native(JsContext *ctx, JsValue this_val, const JsValue *args,
+                                 int argc, JsValue *result) {
+    (void)this_val;
+    mdy_engine *e = js_context_userdata(ctx);
+    char *spec = argc > 0 ? js_string_utf8(args[0]) : NULL;
+    if (!spec) { *result = js_undefined(); return true; }
+    const char *why = "";
+    mdy_engine *set = lookup_import(e, spec, &why);
+    free(spec);
+    if (!set) {
+        const char *msg = "mdy: import was not resolved";
+        *result = str(e->vm, msg, strlen(msg));
+        return false;
+    }
+    /* Values stay the CALLER's — only the root to read from changes. */
+    return resize_in(e, set, args + 1, argc - 1, result);
+}
+
+static bool resize_in(mdy_engine *e, mdy_engine *from, const JsValue *args,
+                      int argc, JsValue *result) {
     char msg[768];
 
 #define RESIZE_FAIL(...) do { \
@@ -3331,14 +3587,14 @@ static bool resize_native(JsContext *ctx, JsValue this_val, const JsValue *args,
         }
     }
 
-    if (!e->root) {
+    if (!from->root) {
         free(path); free(ext); free(shown);
         RESIZE_FAIL("resize: this document set was not opened from a directory, "
                     "so there is no file to read");
     }
 
     size_t len = 0;
-    uint8_t *bytes = fsx_read(e->root, path, &len);
+    uint8_t *bytes = fsx_read(from->root, path, &len);
     if (!bytes) {
         snprintf(msg, sizeof msg, "resize: cannot read %s", path);
         free(path); free(ext); free(shown);
@@ -3385,6 +3641,129 @@ static bool resize_native(JsContext *ctx, JsValue this_val, const JsValue *args,
 #undef RESIZE_FAIL
 }
 
+
+/* ---- guest ES modules --------------------------------------------------------
+ *
+ * The OTHER kind of import: `% const util = await import("./lib/util.js")`.
+ *
+ * `% import x from "…"` is an mdy PACKAGE, rewritten before the compiler ever
+ * sees it (see rewrite_imports). This is a real ES module, compiled and linked
+ * by the engine, and it reaches the host through two callbacks.
+ *
+ * Modules stay INSIDE their own package, mirroring the package-import design:
+ * an imported package's templates load their own modules through their own
+ * set, and nothing here reaches across a package root or outside the graph.
+ */
+
+/*
+ * A specifier's canonical form: an ABSOLUTE path inside the package, which
+ * becomes the module's registry identity. So "./util.js" reached from two
+ * directories is two modules, and one file reached by two spellings is one.
+ *
+ * A module's own imports resolve against the MODULE; a document's resolve
+ * against the FILE that wrote it — the same rule a relative import follows
+ * everywhere else.
+ */
+static bool module_canonicalize(void *ud, const uint16_t *spec, size_t spec_len,
+                                const uint16_t *referrer, size_t ref_len,
+                                const uint16_t **out, size_t *out_len) {
+    mdy_engine *e = ud;
+    char *specifier = from_utf16(spec, spec_len);
+    char *from = ref_len ? from_utf16(referrer, ref_len) : NULL;
+    if (!specifier) { free(from); return false; }
+
+    char base[4096];
+    if (from && *from) {
+        dirname_of(from, base, sizeof base);
+    } else {
+        /* No referrer: a document asked, so resolve against the document's own
+         * file. `e->current` is the document being rendered. */
+        char joined[4096];
+        char *path = NULL;
+        if (e->current < e->count) {
+            JsValue record = document_record(e, e->current);
+            js_gc_protect(e->vm, &record);
+            path = js_string_utf8(js_object_get(e->vm, record, key(e->vm, "path")));
+            js_gc_unprotect(e->vm, &record);
+        }
+        snprintf(joined, sizeof joined, "%s/%s", e->root ? e->root : "",
+                 path ? path : "");
+        free(path);
+        dirname_of(joined, base, sizeof base);
+    }
+
+    char resolved[4096];
+    resolve_path(base, specifier, resolved, sizeof resolved);
+    free(specifier);
+    free(from);
+
+    /* The engine copies before this returns, so a per-engine buffer is enough
+     * and it need only outlive the call. */
+    free(e->module_spec);
+    size_t n = 0;
+    e->module_spec = to_utf16(resolved, strlen(resolved), &n);
+    if (!e->module_spec) return false;
+    *out = e->module_spec;
+    *out_len = n;
+    return true;
+}
+
+/* The loader answers with a promise; these are the two already-settled cases,
+ * which is all this needs — reading a file here is synchronous. */
+static JsValue settled(JsContext *ctx, JsValue v, int ok) {
+    JsValue p = js_promise_new(ctx);
+    if (js_is_undefined(p)) return p;
+    if (ok) js_resolve(ctx, p, v); else js_reject(ctx, p, v);
+    return p;
+}
+
+/* The module's source, or a rejected promise saying why not. */
+static JsValue module_load(void *ud, JsContext *ctx,
+                           const uint16_t *spec, size_t spec_len,
+                           const uint16_t *referrer, size_t ref_len) {
+    (void)referrer; (void)ref_len;
+    mdy_engine *e = ud;
+    char *specifier = from_utf16(spec, spec_len);
+    char msg[1024];
+
+    if (!specifier) return js_undefined();
+
+    size_t n = strlen(specifier);
+    int js = (n > 3 && ends_with_ci(specifier, ".js")) ||
+             (n > 4 && ends_with_ci(specifier, ".mjs"));
+    if (!js) {
+        snprintf(msg, sizeof msg,
+                 "only .js/.mjs modules can be imported (got \"%s\")", specifier);
+        free(specifier);
+        return settled(ctx, str(e->vm, msg, strlen(msg)), 0);
+    }
+
+    /* Inside this package, and nowhere else. */
+    size_t root_len = e->root ? strlen(e->root) : 0;
+    int inside = e->root && n > root_len + 1 &&
+                 strncmp(specifier, e->root, root_len) == 0 &&
+                 specifier[root_len] == '/';
+    if (!inside) {
+        snprintf(msg, sizeof msg, "module \"%s\" is outside this package (%s)",
+                 specifier, e->root ? e->root : "no directory");
+        free(specifier);
+        return settled(ctx, str(e->vm, msg, strlen(msg)), 0);
+    }
+
+    size_t len = 0;
+    uint8_t *bytes = fsx_read("/", specifier + 1, &len);   /* absolute, minus the leading / */
+    if (!bytes) {
+        snprintf(msg, sizeof msg, "module not found: %s", specifier);
+        free(specifier);
+        return settled(ctx, str(e->vm, msg, strlen(msg)), 0);
+    }
+    free(specifier);
+
+    JsValue source = str(e->vm, (const char *)bytes, len);
+    free(bytes);
+    return settled(ctx, source, 1);
+}
+
 static void register_natives(mdy_engine *e) {
     register_one(e, "__compose", compose_native);
     register_one(e, "__find", find_native);
@@ -3406,6 +3785,7 @@ static void register_natives(mdy_engine *e) {
     register_one(e, "__toc", toc_native);
     register_one(e, "__publish", publish_native);
     register_one(e, "__resize", resize_native);
+    register_one(e, "__importResize", import_resize_native);
 }
 
 /*
@@ -3449,6 +3829,18 @@ mdy_engine *mdy_engine_new(void) {
     if (!e->ctx) { js_vm_free(e->vm); free(e); return NULL; }
     /* So a native can find the engine it belongs to. */
     js_context_set_userdata(e->ctx, e);
+    /*
+     * `await import("./lib/util.js")` — a guest ES module, resolved against
+     * the file that asked and read from inside this package.
+     *
+     * Source modules are a CAPABILITY in lamassu, off unless the frontend
+     * turns them on: the runtime alone can link precompiled bytecode but has
+     * no parser to compile a source string. A document engine compiles
+     * documents from source already, so it has the frontend and this costs
+     * nothing.
+     */
+    js_set_module_loader(e->ctx, module_load, module_canonicalize, e);
+    js_enable_source_modules(e->ctx);
     register_natives(e);
     return e;
 }
@@ -3490,8 +3882,13 @@ void mdy_engine_free(mdy_engine *e) {
     }
     free(e->ident_pre);
     free(e->ident_post);
+    free(e->ident_is_md);
+    free(e->module_spec);
     for (size_t i = 0; i < e->resized_count; i++) free(e->resized[i].path);
     free(e->resized);
+    for (size_t i = 0; i < e->ctx_count; i++) free(e->ctx_names[i]);
+    free(e->ctx_names);
+    free(e->ctx_bools);
     free(e->root);
 
     close_set(e);
@@ -3542,7 +3939,7 @@ static char *wrap(const char *statements) {
         "  __importRender: (s, t, c) => __importRender(s, t, c),\n"
         "  __importFind: (s, q) => __importFind(s, q),\n"
         "  __importFindOne: (s, q) => __importFindOne(s, q),\n"
-        "  __importResize: (s, r, o) => __resize(r, o, JSON.stringify(r)),\n"
+        "  __importResize: (s, r, o) => __importResize(s, r, o === undefined ? {} : o, JSON.stringify(r)),\n"
         "  data: (i) => __data(i),\n"
         "  compose: (o) => __compose(o),\n"
         "};\n"
@@ -3680,6 +4077,35 @@ static mdy_doc *render_tree_out(mdy_engine *e, size_t index, JsValue request,
         return NULL;
     }
     Document *d = &e->docs[index];
+
+    /*
+     * The other front end. A `.md` file is markup with no code in it, so there
+     * is nothing to run: it goes to hast at its own boundary and joins
+     * everything else as a tree. The walk keeps its real text on its DATA
+     * rather than as a body to compile, which is where this reads it from —
+     * and `$.text` on it gives back the file, because no code wrote anything
+     * else.
+     */
+    if (d->is_markdown) {
+        JsValue record = document_record(e, index);
+        js_gc_protect(e->vm, &record);
+        char *text = js_string_utf8(js_object_get(e->vm, record, key(e->vm, "body")));
+        js_gc_unprotect(e->vm, &record);
+        mdy_doc *md = mdy_markdown_parse(text ? text : "", text ? strlen(text) : 0);
+        if (!md) {
+            free(text);
+            if (error && error_len)
+                snprintf(error, error_len, "the markdown document could not be read");
+            e->current = outer_current;
+            e->depth--;
+            return NULL;
+        }
+        if (wrote) *wrote = text; else free(text);
+        e->current = outer_current;
+        e->depth--;
+        return md;
+    }
+
     /* 1. the body, which `mdy_engine_open` already took the data out of */
     size_t template_len = 0;
     const char *template_text = mdy_data_body(d->fences, &template_len);
@@ -3847,7 +4273,33 @@ done:
 
 char *mdy_engine_render(mdy_engine *e, size_t index, char *error, size_t error_len) {
     if (error && error_len) error[0] = '\0';
-    mdy_doc *doc = render_tree(e, index, js_undefined(), error, error_len);
+
+    /*
+     * The entry document's `req` carries `today` — today's date as
+     * YYYY-MM-DD, which is what a site compares a post's date against to
+     * decide whether it is published yet. mdy-docs builds the same context,
+     * from `new Date()` normalised through toISOString, so it is the UTC day.
+     *
+     * `MDY_TODAY` overrides it, which is how a build is made repeatable: a
+     * site that hides future posts renders differently tomorrow, and a test
+     * that could not pin this would rot on its own.
+     */
+    JsValue context = js_object_new(e->ctx);
+    js_gc_protect(e->vm, &context);
+    const char *forced = getenv("MDY_TODAY");
+    char today[40];
+    if (forced && *forced) {
+        snprintf(today, sizeof today, "%s", forced);
+    } else {
+        iso8601_utc((double)time(NULL) * 1000.0, today, sizeof today);
+        today[10] = '\0';                    /* the date, without the time */
+    }
+    set_val(e, context, "today", str(e->vm, today, strlen(today)));
+    for (size_t i = 0; i < e->ctx_count; i++)
+        set_val(e, context, e->ctx_names[i], js_bool(e->ctx_bools[i] != 0));
+
+    mdy_doc *doc = render_tree(e, index, context, error, error_len);
+    js_gc_unprotect(e->vm, &context);
     if (!doc) { release_held(e); return NULL; }
     char *html = mdy_to_html(mdy_root(doc), NULL);
     mdy_free(doc);

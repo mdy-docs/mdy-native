@@ -20,7 +20,7 @@
 #include "engine.h"
 #include "fsx.h"
 
-typedef struct { const char *out; int count; int failed; int messages; int images; } Sink;
+typedef struct { const char *out; int count; int failed; int messages; int images; int quiet; } Sink;
 
 static void write_page(void *ud, const char *path, const char *content) {
     Sink *s = ud;
@@ -53,7 +53,7 @@ static void note_message(void *ud, const char *name, const char *data_json,
                          size_t doc_index) {
     Sink *s = ud;
     (void)doc_index;
-    if (s->messages < 5)
+    if (!s->quiet && s->messages < 5)
         fprintf(stderr, "[publish] %s %s\n", name, data_json);
     s->messages++;
 }
@@ -70,6 +70,14 @@ static int copy_static(const char *root, const char *out) {
         next = nl ? nl + 1 : NULL;
         if (nl) *nl = '\0';
         if (!*rel) continue;
+        /*
+         * A `.mdy` under static/ is a metadata SIDECAR — static/logo.png.mdy
+         * describes static/logo.png. It belongs in the document set, findable
+         * by `$.find`, and must not be published as a raw text file a visitor
+         * could stumble onto.
+         */
+        size_t rlen = strlen(rel);
+        if (rlen >= 4 && strcmp(rel + rlen - 4, ".mdy") == 0) continue;
         size_t len = 0;
         uint8_t *bytes = fsx_read(dir, rel, &len);
         if (!bytes) continue;
@@ -82,15 +90,18 @@ static int copy_static(const char *root, const char *out) {
 
 int main(int argc, char **argv) {
     const char *root = NULL, *out = NULL, *entry = "main.mdy";
-    int quiet = 0;
+    int quiet = 0, drafts = 0, future = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out = argv[++i];
         else if (strcmp(argv[i], "--entry") == 0 && i + 1 < argc) entry = argv[++i];
         else if (strcmp(argv[i], "--quiet") == 0) quiet = 1;
+        else if (strcmp(argv[i], "--drafts") == 0) drafts = 1;
+        else if (strcmp(argv[i], "--future") == 0) future = 1;
         else if (!root) root = argv[i];
     }
     if (!root || !out) {
-        fprintf(stderr, "usage: mdy-build <site-dir> --out <dir> [--entry main.mdy] [--quiet]\n");
+        fprintf(stderr, "usage: mdy-build <site-dir> --out <dir> "
+                        "[--entry main.mdy] [--drafts] [--future] [--quiet]\n");
         return 2;
     }
 
@@ -104,6 +115,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* A build's own policy, on the entry's `req` — whether to include
+     * documents marked draft or dated in the future. buildSite sets both
+     * unconditionally, so a site can read them without checking. */
+    mdy_engine_set_context_bool(e, "drafts", drafts);
+    mdy_engine_set_context_bool(e, "future", future);
+
     int at = mdy_engine_entry(e, entry);
     if (at < 0) {
         fprintf(stderr, "entry script not found at \"%s\" (looked among %zu document(s) under %s)\n",
@@ -112,7 +129,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    Sink sink = { out, 0, 0, 0, 0 };
+    Sink sink = { out, 0, 0, 0, 0, quiet };
     mdy_engine_on_emit(e, write_page, &sink);
     mdy_engine_on_publish(e, note_message, &sink);
     mdy_engine_on_binary(e, write_image, &sink);

@@ -1,5 +1,5 @@
 /*
- * The nisaba side. Includes nisaba's headers and nothing from QuickJS.
+ * The nisaba side. Includes nisaba's headers and nothing else.
  *
  * Storage is ours to supply: nisaba's shipped bjio_host(fd) reaches into
  * Module.bjioHandles, a table of JS FileSystemSyncAccessHandle objects, which

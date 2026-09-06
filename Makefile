@@ -1,64 +1,45 @@
-# mdy-native — the backend as a binary: mdy-docs' own JavaScript in QuickJS,
-# with lamassu and nisaba linked as C rather than loaded as WebAssembly.
-# See ../../docs/desktop-plan.md.
+# mdy-native — the mdy engine as a binary. No JavaScript engine but lamassu,
+# which runs the templates; the walk, the document store, composition and the
+# output are C. See ../../docs/desktop-plan.md.
 #
-#   make native            build both halves and run the checks
-#   make site SITE=<dir>   `mdy build`, natively
-#   make bench             the same document set, native and over WASM in node
+#   make build/mdy-build          the engine, as a command
+#   make check-engine             its unit checks, twice (see the target)
+#   make check-sites              every site here, built BOTH ways and diffed
+#   make check-site SITE=<dir>    one site, the same way
+#
+# The suite is check-sites: mdy-docs' own JavaScript against this engine over
+# real input. It is node that drives it, and node that says what the answer
+# should be — there is no second implementation of the expectations to drift.
 #
 # PORTABILITY. Everything here is plain C with no dependency on a system
-# package: QuickJS is a submodule built from source, and lamassu and nisaba are
-# submodules of the parent. The only files that know which operating system
+# package: lamassu, nisaba and the front end are submodules. The only files that know which operating system
 # this is are src/fsx.c and src/nis.c, because both engines are platform-clean
 # — lamassu has no #ifdefs at all and nisaba's I/O is behind its bj_io
 # callbacks. See docs/desktop-plan.md, Phase 4.
 
-# Submodules of this repository, so the C engine and its tests build from a
+# Submodules of this repository, so the engine and its checks build from a
 # clean clone. Inside an mdy-docs checkout they are the same two checkouts one
 # level up, and pointing these at those avoids a second copy:
 #     make NISABA=../../third_party/nisaba-db LAMASSU=../../third_party/lamassu-js
 NISABA  ?= third_party/nisaba-db
 LAMASSU ?= third_party/lamassu-js
-QUICKJS ?= third_party/quickjs
 
 # gnu11, not c11. glibc hides POSIX declarations under a strict standard —
 # strdup came back as an implicit declaration on Linux and st_mtim as an
 # unknown field, both of which compile fine on macOS, which exposes them
 # regardless. lamassu's own Makefile carries the same note and reaches for
 # -D_POSIX_C_SOURCE; gnu11 gets the same result and also works under mingw.
-CFLAGS  += -std=gnu11 -Wall -Wextra -O2 -g -I$(LAMASSU)/include -I$(QUICKJS)
+CFLAGS  += -std=gnu11 -Wall -Wextra -O2 -g -I$(LAMASSU)/include
 LDLIBS  += -lm
 
 # Windows has no libpthread of its own and mingw's winpthreads is not needed:
-# nothing here starts a thread. Elsewhere QuickJS wants it.
+# nothing here starts a thread.
 ifeq ($(OS),Windows_NT)
   EXE := .exe
 else
   LDLIBS += -lpthread
   EXE :=
 endif
-
-# ---- QuickJS --------------------------------------------------------------
-#
-# Built from its own sources rather than linked from a system package, so the
-# build is identical on every platform and pinned to one commit. quickjs-libc
-# is deliberately NOT here: it is the `std`/`os` module layer, and this host
-# supplies its own natives (see src/host.c). Leaving it out also leaves out its
-# POSIX assumptions, which is most of what would need porting.
-QJS_SRCS := $(QUICKJS)/quickjs.c $(QUICKJS)/dtoa.c $(QUICKJS)/libregexp.c \
-            $(QUICKJS)/libunicode.c $(QUICKJS)/cutils.c
-QJS_OBJS := $(patsubst $(QUICKJS)/%.c,build/qjs/%.o,$(QJS_SRCS))
-
-# gnu11, not c11: quickjs.c uses `asm volatile` in its spin hint, which strict
-# C hides behind __asm__. `-w` rather than a clang-specific -Wno-everything —
-# this has to compile under gcc and mingw too, and QuickJS is third-party code
-# that does not build clean under our warning set.
-build/qjs/%.o: $(QUICKJS)/%.c
-	@mkdir -p build/qjs
-	$(CC) -std=gnu11 -O2 -DCONFIG_VERSION='"mdy-native"' -w -c $< -o $@
-
-build/libquickjs.a: $(QJS_OBJS)
-	$(AR) rcs $@ $(QJS_OBJS)
 
 # ---- lamassu --------------------------------------------------------------
 #
@@ -155,42 +136,6 @@ STB_INC   := -Ithird_party/stb
 $(PARSE_LIB):
 	$(MAKE) -C $(PARSE) build/libmdyast.a
 
-# ---- the backend ----------------------------------------------------------
-
-HOST_SRCS := src/host.c src/lam.c src/nis.c src/fsx.c src/oswin.c src/parse.c
-HOST_HDRS := src/lam.h src/nis.h src/fsx.h src/oswin.h
-
-build/mdy-native$(EXE): $(HOST_SRCS) $(HOST_HDRS) build/libquickjs.a build/libnisaba.a $(LAM_LIBS) $(PARSE_LIB)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(HOST_SRCS) \
-	  build/libnisaba.a $(LAM_LIBS) $(PARSE_LIB) build/libquickjs.a -o $@ $(LDLIBS)
-
-# build/mdy.js is the bundle: mdy-docs through esbuild with the two engine
-# imports aliased to shims/. See scripts-build.mjs.
-# SHIMS is every shim, not the three that were listed: shims/parse.js was
-# added later and left off, so a bundle built after editing it silently kept
-# the old one — which then called the bridge with the old signature and handed
-# hast the bridge's whole result as if it were a tree.
-SHIMS := $(wildcard shims/*.js) $(wildcard shims/node/*.js)
-
-build/mdy.js: entry.mjs scripts-build.mjs $(SHIMS)
-	node scripts-build.mjs
-
-build/site.js: site-entry.mjs scripts-build.mjs $(SHIMS)
-	node scripts-build.mjs site
-
-# mdy-docs' own suite, bundled to run against this backend. The test files are
-# imported in place from ../../test — not copied — so they cannot drift.
-build/tests.js: tests-entry.mjs scripts-build.mjs $(SHIMS) $(wildcard ../../test/*.js)
-	node scripts-build.mjs tests
-
-build/bench.js: bench-entry.mjs bench-body.mjs scripts-build.mjs $(SHIMS)
-	node scripts-build.mjs bench
-
-# `make site SITE=../../examples/docs-site OUT=/tmp/out` — the CLI's own build
-# path, run natively.
-SITE ?= fixture
-OUT  ?= build/site-out
 
 # ---- the golden outputs ---------------------------------------------------
 #
@@ -221,14 +166,14 @@ golden:
 # A golden site whose output moves is worse than no golden site: it goes red
 # for a reason that is not a regression. This proves each one is stable across
 # the thing a git checkout actually changes — every file's mtime.
-check-determinism: build/mdy-native$(EXE) build/site.js
-	@bin=./build/mdy-native$(EXE); fail=0; \
+check-determinism: build/mdy-build$(EXE)
+	@bin=./build/mdy-build$(EXE); fail=0; \
 	for d in $(GOLDEN_SITES); do \
 	  n=`basename $$d`; \
 	  rm -rf build/det-$$n-a build/det-$$n-b; \
-	  $$bin build/site.js $$d build/det-$$n-a > /dev/null || exit 1; \
+	  $$bin $$d --out build/det-$$n-a --quiet || exit 1; \
 	  find $$d -type f -exec touch {} \; ; \
-	  $$bin build/site.js $$d build/det-$$n-b > /dev/null || exit 1; \
+	  $$bin $$d --out build/det-$$n-b --quiet || exit 1; \
 	  if diff -r build/det-$$n-a build/det-$$n-b > /dev/null; then \
 	    echo "  $$n: stable across an mtime change"; \
 	  else \
@@ -237,12 +182,12 @@ check-determinism: build/mdy-native$(EXE) build/site.js
 	done; \
 	exit $$fail
 
-check-golden: build/mdy-native$(EXE) build/site.js
-	@bin=./build/mdy-native$(EXE); fail=0; \
+check-golden: build/mdy-build$(EXE)
+	@bin=./build/mdy-build$(EXE); fail=0; \
 	for d in $(GOLDEN_SITES); do \
 	  n=`basename $$d`; \
 	  rm -rf build/check-$$n; \
-	  $$bin build/site.js $$d build/check-$$n > /dev/null || exit 1; \
+	  $$bin $$d --out build/check-$$n --quiet || exit 1; \
 	  if diff -r golden/$$n build/check-$$n > /dev/null; then \
 	    echo "  $$n: identical to golden"; \
 	  else \
@@ -251,7 +196,7 @@ check-golden: build/mdy-native$(EXE) build/site.js
 	done; \
 	exit $$fail
 
-.PHONY: build native site bench test test-c-parser check-ingest check-engine clean
+.PHONY: check-ingest check-engine check-site check-sites clean
 
 # A document from text into a nisaba collection, with no JavaScript in it:
 # data fences, YAML, binjson, dc_insert_one, and a query back out. This is the
@@ -266,7 +211,8 @@ check-ingest: build/ingest-test$(EXE)
 	@./build/ingest-test$(EXE)
 
 # One document, end to end, with no JavaScript engine but lamassu — the three
-# passes of src/mdy.js done in C. QuickJS is not linked into this binary.
+# passes of src/mdy.js done in C. No JavaScript engine but lamassu is linked
+# into this binary.
 build/engine-test$(EXE): test/engine.c src/engine.c src/ingest.c src/nis.c src/fsx.c src/images.c $(NIS_SRCS) $(LAM_LIBS) $(PARSE_LIB)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc $(NIS_INC) $(PARSE_INC) $(STB_INC) $(NIS_RENAME) \
@@ -309,36 +255,39 @@ check-engine: build/engine-test$(EXE)
 #   make check-site SITE=../../../../site
 check-site: build/mdy-build$(EXE)
 	@node scripts-compare-site.mjs "$(SITE)"
-# The 713 of mdy-docs' 776 tests that a runtime with no subprocesses, no HTTP
-# server and no WebAssembly can run. See tests-entry.mjs for what is left out
-# and why each one is a property of the runtime rather than a gap in the port.
-test: build/mdy-native$(EXE) build/tests.js
-	@./build/mdy-native$(EXE) build/tests.js
-# `make build` rather than `make build/mdy-native`: the target's name carries
-# .exe on Windows, and a caller should not have to know that.
-# The same suite against the C front end, which is a SUBSET of what mdy-docs
-# documents — it renders the reference corpus byte-for-byte and does not yet
-# implement `#` comments, table captions or the `script` option. This prints
-# what is missing as a number so it can be watched going down; it is not a
-# gate, because the failures here are known and listed in README.md.
-test-c-parser: build/mdy-native$(EXE)
-	@MDY_PARSER=c node scripts-build.mjs tests
-	@./build/mdy-native$(EXE) build/tests.js > build/c-parser.log 2>&1 || true
-	@grep -c '^FAIL ' build/c-parser.log | sed 's/^/failing with the C front end: /'
-	@grep -o 'cannot honour `[a-zA-Z]*`' build/c-parser.log | sort | uniq -c | sort -rn | sed 's/^/  /'
-	@node scripts-build.mjs tests   # leave build/tests.js as `make test` expects it
 
-build: build/mdy-native$(EXE)
+# THE SUITE. Every site in this repository, built both ways and diffed.
+#
+# It replaced running mdy-docs' JavaScript test files inside a second engine.
+# That proved "mdy-docs runs unchanged on the native backend" — a claim about
+# a binary that no longer exists. This proves the thing that matters now: the
+# C engine and mdy-docs agree, on real input, byte for byte. Pointing it at
+# these five found eight bugs in an engine that already built a 93-page site
+# identically, and not one of them failed a unit test.
+#
+# Two sites differ on purpose, by an EXACT amount, and the check fails if
+# either count moves in either direction:
+#
+#   blog       1: its search index tokenizes its own `$.text` output, which
+#                 contains a composition TOKEN — and a token's id depends on
+#                 how many renders came before it. mdy-docs memoises a render
+#                 on (document, request); this engine does not, so it holds
+#                 more trees and the ids run ahead.
+#   docs-site  2: its pages emit raw HTML for the markdown front end to stitch
+#                 back, which is rehype-raw's HTML5 round trip. md4c does not
+#                 do it, and the difference is blank lines around the block.
+CHECK_SITES := ../../examples/blog:1 ../../examples/docs-site:2 \
+               ../../examples/messaging:0 fixture:0 fixture-pkg:0
+check-sites: build/mdy-build$(EXE)
+	@fail=0; for s in $(CHECK_SITES); do \
+	  dir=$${s%:*}; want=$${s##*:}; \
+	  printf '%-34s ' "$$dir"; \
+	  node scripts-compare-site.mjs "$$dir" --expect "$$want" || fail=1; \
+	done; exit $$fail
 
-native: build/mdy-native$(EXE) build/mdy.js
-	@./build/mdy-native$(EXE) build/mdy.js
 
-site: build/mdy-native$(EXE) build/site.js
-	@./build/mdy-native$(EXE) build/site.js $(SITE) $(OUT)
 
-bench: build/mdy-native$(EXE) build/bench.js
-	@/usr/bin/time -l ./build/mdy-native$(EXE) build/bench.js 2>&1 | grep -E "native:|maximum resident"
-	@/usr/bin/time -l node bench-node.mjs 2>&1 | grep -E "node:|maximum resident"
+
 
 clean:
 	rm -rf build

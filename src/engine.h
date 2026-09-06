@@ -15,7 +15,7 @@
  * and then, because a page has to become a file, the tree is written as HTML
  * (mdyhtml.h).
  *
- * QuickJS is not involved at any point. lamassu runs the DOCUMENT's code,
+ * No second JavaScript engine is involved. lamassu runs the DOCUMENT's code,
  * which is what it has always been for; everything around it is C.
  *
  * WHAT THIS DOES NOT DO YET, and each is a step of its own:
@@ -99,6 +99,16 @@ void mdy_engine_on_binary(mdy_engine *engine,
                           void (*fn)(void *ud, const char *path,
                                      const uint8_t *bytes, size_t len),
                           void *ud);
+
+/*
+ * A field on the entry document's `req`, set before rendering it.
+ *
+ * The engine supplies `today` on its own, because a site compares a post's
+ * date against it. A BUILD supplies `drafts` and `future` — whether to include
+ * documents marked as one or dated in it — which are the embedder's policy,
+ * not the engine's. Call before mdy_engine_render.
+ */
+void mdy_engine_set_context_bool(mdy_engine *engine, const char *name, int value);
 
 /* How many documents the open set holds. */
 size_t mdy_engine_count(mdy_engine *engine);
